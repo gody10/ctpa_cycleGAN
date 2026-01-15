@@ -30,6 +30,11 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--pool_size', type=int, default=50, help='the size of image buffer that stores previously generated images')
         parser.add_argument('--lr_policy', type=str, default='linear', help='learning rate policy. [linear | step | plateau | cosine]')
         parser.add_argument('--lr_decay_iters', type=int, default=50, help='multiply by a gamma every lr_decay_iters iterations')
+        
+        # Validation and early stopping parameters (inspired by attached train.py)
+        parser.add_argument('--use_validation', action='store_true', help='enable validation loop with early stopping')
+        parser.add_argument('--patience', type=int, default=50, help='early stopping patience (number of epochs without improvement)')
+        parser.add_argument('--log_file', type=str, default='train_log.txt', help='filename for training log')
 
         self.isTrain = True
         return parser
