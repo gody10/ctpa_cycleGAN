@@ -17,7 +17,9 @@ spec:
               terminationMessagePath: "/tmp/my-log"
               imagePullPolicy: 'Always'
               command: ["/bin/bash"]
-              args: ["-c", "python train.py --dataroot ../data/Coltea_Processed_Nifti --name coltea_cyclegan --model cycle_gan --input_nc 1 --output_nc 1"]  
+              args: ["-c", "python plot_losses.py --name coltea_cyclegan"]  
+              # python train.py --dataroot ../data/Coltea_Processed_Nifti --name coltea_cyclegan --model cycle_gan --input_nc 1 --output_nc 1
+              # python test.py --dataroot ../data/Coltea_Processed_Nifti --name coltea_cyclegan --model cycle_gan --input_nc 1 --output_nc 1
               resources:
                     requests:
                         cpu: 20

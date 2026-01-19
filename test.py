@@ -1,13 +1,12 @@
 """Test script for CycleGAN with Coltea CT dataset.
 
 This script tests a trained CycleGAN model for arterial-to-native CT translation.
-It computes PSNR/SSIM metrics, saves comparison images, and exports NIfTI volumes.
+It computes PSNR/SSIM metrics, saves comparison images (Input | Generated | GT), 
+and exports NIfTI volumes.
 
 Example:
     python test.py --dataroot ../data/Coltea_Processed_Nifti --name coltea_cyclegan --model cycle_gan \
         --input_nc 1 --output_nc 1 --epoch best
-
-See options/test_options.py for more test options.
 """
 
 import os
@@ -76,43 +75,53 @@ def tensor_to_numpy(tensor):
     return img
 
 
-def save_comparison_slice(art_img, pred_img, gt_img, patient_id, psnr_val, ssim_val, output_dir):
-    """Saves a PNG showing Input, Prediction, and Ground Truth side by side."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+def save_comparison_grid(art_slice, pred_slice, gt_slice, patient_id, slice_idx, output_dir):
+    """
+    Saves a PNG showing Input, Prediction, and Ground Truth side by side.
     
-    # Input (Arterial)
-    axes[0].imshow(art_img, cmap="gray", vmin=0, vmax=1)
-    axes[0].set_title("Input (Arterial)")
+    Args:
+        art_slice: 2D numpy array [H, W] (Input/Arterial)
+        pred_slice: 2D numpy array [H, W] (Generated Native)
+        gt_slice: 2D numpy array [H, W] (Ground Truth Native)
+        patient_id: str
+        slice_idx: int, the z-index of this slice
+        output_dir: str
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # Common display settings
+    kwargs = {'cmap': 'gray', 'vmin': 0, 'vmax': 1}
+    
+    # 1. Input (Arterial)
+    axes[0].imshow(art_slice, **kwargs)
+    axes[0].set_title("Input (Arterial / Contrast)")
     axes[0].axis("off")
     
-    # Prediction (Generated Native)
-    axes[1].imshow(pred_img, cmap="gray", vmin=0, vmax=1)
-    axes[1].set_title(f"Generated (PSNR: {psnr_val:.2f}, SSIM: {ssim_val:.3f})")
+    # 2. Prediction (Generated Native)
+    axes[1].imshow(pred_slice, **kwargs)
+    axes[1].set_title("Generated (Native)")
     axes[1].axis("off")
     
-    # Ground Truth (Native)
-    axes[2].imshow(gt_img, cmap="gray", vmin=0, vmax=1)
+    # 3. Ground Truth (Native)
+    axes[2].imshow(gt_slice, **kwargs)
     axes[2].set_title("Ground Truth (Native)")
     axes[2].axis("off")
     
+    plt.suptitle(f"{patient_id} - Slice {slice_idx}", fontsize=14)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{patient_id}_comparison.png"), dpi=150)
+    
+    # Create 'slices' subdirectory to keep things organized
+    slices_dir = os.path.join(output_dir, "slices")
+    os.makedirs(slices_dir, exist_ok=True)
+    
+    save_path = os.path.join(slices_dir, f"{patient_id}_slice_{slice_idx:03d}.png")
+    plt.savefig(save_path, dpi=150)
     plt.close(fig)
 
 
-def test_full_volume(model, batch, opt):
+def test_full_volume(model, batch, opt, patient_id, output_dir):
     """
-    Process entire 3D volume slice by slice and return generated volume.
-    
-    Args:
-        model: CycleGAN model
-        batch: Dictionary with "image" and "label" tensors [B, C, H, W, D]
-        opt: Options with input_nc setting
-    
-    Returns:
-        generated_volume: numpy array [H, W, D]
-        ground_truth_volume: numpy array [H, W, D]
-        input_volume: numpy array [H, W, D]
+    Process entire 3D volume slice by slice and save slice examples.
     """
     image = batch["image"]  # [B, C, H, W, D]
     label = batch["label"]
@@ -123,6 +132,13 @@ def test_full_volume(model, batch, opt):
     B, C, H, W, D = image.shape
     generated_slices = []
     
+    # Determine indices to save (e.g., 25%, 50%, 75% of the depth)
+    save_indices = {
+        int(D * 0.25), 
+        int(D * 0.50), 
+        int(D * 0.75)
+    }
+
     # Process each slice
     for d in range(D):
         # Extract single slice
@@ -156,7 +172,7 @@ def test_full_volume(model, batch, opt):
         elif 'fake' in visuals:
             gen_slice = visuals['fake']
         else:
-            # Fallback: use first visual that's not real
+            # Fallback
             for key, val in visuals.items():
                 if 'real' not in key.lower():
                     gen_slice = val
@@ -164,17 +180,31 @@ def test_full_volume(model, batch, opt):
         
         gen_np = tensor_to_numpy(gen_slice)
         generated_slices.append(gen_np)
+        
+        # --- SAVE SLICE EXAMPLES ---
+        if d in save_indices:
+            input_np = tensor_to_numpy(slice_data["A"])
+            gt_np = tensor_to_numpy(slice_data["B"])
+            
+            save_comparison_grid(
+                input_np, 
+                gen_np, 
+                gt_np, 
+                patient_id, 
+                d, 
+                output_dir
+            )
     
     # Stack slices into volume
     generated_volume = np.stack(generated_slices, axis=-1)  # [H, W, D]
     
     # Get input and ground truth volumes
-    input_volume = image.squeeze().cpu().numpy()  # [H, W, D] or [C, H, W, D]
+    input_volume = image.squeeze().cpu().numpy()
     gt_volume = label.squeeze().cpu().numpy()
     
-    # Handle channel dimension
+    # Handle channel dimension if present
     if input_volume.ndim == 4:
-        input_volume = input_volume[0]  # Take first channel
+        input_volume = input_volume[0]
         gt_volume = gt_volume[0]
     
     return generated_volume, gt_volume, input_volume
@@ -236,43 +266,24 @@ if __name__ == "__main__":
             patient_id = f"patient_{i:03d}"
             
             try:
-                # Process full 3D volume
-                generated_vol, gt_vol, input_vol = test_full_volume(model, batch, opt)
+                # Process full 3D volume and save examples inside
+                generated_vol, gt_vol, input_vol = test_full_volume(model, batch, opt, patient_id, output_dir)
                 
                 # Compute metrics on full volume
                 psnr_val = psnr(gt_vol, generated_vol, data_range=1.0)
                 ssim_val = ssim(gt_vol, generated_vol, data_range=1.0)
                 
-                # Store results
                 results.append({
                     "patient_id": patient_id,
                     "PSNR": psnr_val,
                     "SSIM": ssim_val
                 })
                 
-                # Save comparison PNG (middle slice)
-                mid_z = generated_vol.shape[-1] // 2
-                save_comparison_slice(
-                    input_vol[:, :, mid_z],
-                    generated_vol[:, :, mid_z],
-                    gt_vol[:, :, mid_z],
-                    patient_id,
-                    psnr_val,
-                    ssim_val,
-                    output_dir
-                )
-                
                 # Save NIfTI volumes
                 nib.save(
                     nib.Nifti1Image(generated_vol, affine=np.eye(4)),
                     os.path.join(output_dir, f"{patient_id}_pred.nii.gz")
                 )
-                
-                # Optionally save input/GT (comment out to save space)
-                # nib.save(nib.Nifti1Image(input_vol, affine=np.eye(4)), 
-                #          os.path.join(output_dir, f"{patient_id}_input.nii.gz"))
-                # nib.save(nib.Nifti1Image(gt_vol, affine=np.eye(4)), 
-                #          os.path.join(output_dir, f"{patient_id}_gt.nii.gz"))
                 
             except Exception as e:
                 print(f"\nError processing {patient_id}: {e}")
@@ -294,5 +305,7 @@ if __name__ == "__main__":
     print(f"Average PSNR: {df['PSNR'].mean():.4f} ± {df['PSNR'].std():.4f}")
     print(f"Average SSIM: {df['SSIM'].mean():.4f} ± {df['SSIM'].std():.4f}")
     print(f"\nResults saved to: {output_dir}")
-    print(f"Metrics CSV: {os.path.join(output_dir, 'metrics.csv')}")
+    print(f"  > Metrics: metrics.csv")
+    print(f"  > Images:  slices/ directory")
+    print(f"  > Volumes: .nii.gz files")
     print("=" * 60)
