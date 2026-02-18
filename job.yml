@@ -17,16 +17,57 @@ spec:
               terminationMessagePath: "/tmp/my-log"
               imagePullPolicy: 'Always'
               command: ["/bin/bash"]
-              args: ["-c", "python plot_losses.py --name coltea_cyclegan"]  
-              # python train.py --dataroot ../data/Coltea_Processed_Nifti --name coltea_cyclegan --model cycle_gan --input_nc 1 --output_nc 1
-              # python test.py --dataroot ../data/Coltea_Processed_Nifti --name coltea_cyclegan --model cycle_gan --input_nc 1 --output_nc 1
+
+              # ──────────────────────────────────────────────────────────
+              # Uncomment ONE args line below depending on what you need.
+              # CSV splits: defaults to train_data.csv / eval_data.csv / test_data.csv
+              #   Add --train_csv / --val_csv / --test_csv to override, e.g.:
+              #   --train_csv ../data/Coltea-Lung-CT-100W/clean_train_data.csv
+              #   --val_csv ../data/Coltea-Lung-CT-100W/clean_eval_data.csv
+              #   --test_csv ../data/Coltea-Lung-CT-100W/clean_test_data.csv
+              # ──────────────────────────────────────────────────────────
+
+              args: ["-c", "python test.py \
+                    --dataroot ../data/Coltea_Processed_Nifti \
+                    --test_csv ../data/Coltea-Lung-CT-100W/test_data.csv \
+                    --name coltea_cyclegan_clean \
+                    --model cycle_gan \
+                    --input_nc 1 --output_nc 1 \
+                    --epoch best \
+                    --eval"
+                                        ]
+
+              # Option A — Retrain from scratch (registered data, new experiment name)
+              #args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_retrain --model cycle_gan --input_nc 1 --output_nc 1 --n_epochs 1000 --n_epochs_decay 100 --batch_size 4 --use_validation --patience 100 --no_html"]
+
+              # Option A (clean CSVs) — Same but using quality-filtered patient lists
+              # args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Coltea_Processed_Nifti_Registered --train_csv ../data/Coltea-Lung-CT-100W/clean_train_data.csv --val_csv ../data/Coltea-Lung-CT-100W/clean_eval_data.csv --name coltea_cyclegan_clean --model cycle_gan --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100 --batch_size 4 --use_validation --patience 30 --no_html"]
+
+              # Option B — Resume training from checkpoint (change --epoch_count to the epoch to resume from)
+              # args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --continue_train --epoch_count 150 --n_epochs 100 --n_epochs_decay 100 --batch_size 4 --use_validation --patience 30 --no_html"]
+
+              # Option C — Test only (PSNR/SSIM metrics + visual grids)
+              # args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --epoch latest --eval"]
+
+              # Option C (clean CSVs) — Test using clean test split
+              # args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered --test_csv ../data/Coltea-Lung-CT-100W/clean_test_data.csv --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --epoch latest --eval"]
+
+              # Option D — Inference + 3D stitching (for model comparison, no post-processing)
+              #args: ["-c", "python inference_and_stitch.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --epoch latest --eval"]
+
+              # Option E — Compare CycleGAN vs Diffusion (PSNR, SSIM, FID)
+              # args: ["-c", "python compare_models.py --diffusion_dir ../ctpa_medvae_latent_diffusion/predictions_medvae_ldm/ --cyclegan_dir ./results/coltea_cyclegan_with_val/stitched_3d_epoch_latest/ --gt_from_cyclegan --compute_fid --output_dir ./comparison_results/"]
+
+              # Option F — Plot training loss curves
+              # args: ["-c", "python plot_losses.py --name coltea_cyclegan_with_val"]
+
               resources:
                     requests:
-                        cpu: 20
+                        cpu: 10
                         memory: '64Gi'
                         nvidia.com/gpu: 1
                     limits:
-                        cpu: 20
+                        cpu: 10
                         memory: '64Gi'
                         nvidia.com/gpu: 1
               volumeMounts:

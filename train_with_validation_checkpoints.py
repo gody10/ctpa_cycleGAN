@@ -1,22 +1,15 @@
-"""Training script for CycleGAN baseline with data-parity to 3D Latent Diffusion.
+"""Training script for CycleGAN baseline with validation checkpoints.
 
-Uses ColteaSliceDataset which:
-  - Loads NIfTI volumes with fixed HU windowing [-1000, 1000] (matches diffusion model)
-  - Extracts ALL 2D axial slices (not just the middle slice)
-  - Returns slices in [-1, 1] ready for CycleGAN
-
-Architecture: vanilla ResNet-9blocks generator + 70x70 PatchGAN discriminator.
-
-Example:
-    python train.py --dataroot ../data/Coltea_Processed_Nifti_Registered \
-        --name coltea_cyclegan_baseline --model cycle_gan \
-        --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100
+Uses ColteaSliceDataset with diffusion-matched HU windowing [-1000, 1000].
+Includes validation loop with L1 + PSNR tracking and best-model saving.
 """
 
 import time
 import logging
 import os
 import torch
+import torch.nn as nn
+import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
@@ -25,7 +18,6 @@ from models import create_model
 from util.visualizer import Visualizer
 from util.util import init_ddp, cleanup_ddp
 
-# New slice-based dataset with diffusion-matched normalization
 from dataset import ColteaSliceDataset
 
 
@@ -69,21 +61,35 @@ def setup_logging(opt):
     logger.info(f"  Epochs: {opt.n_epochs} + {opt.n_epochs_decay} decay")
     logger.info(f"  Input channels: {opt.input_nc}")
     logger.info(f"  Output channels: {opt.output_nc}")
-    logger.info(f"  Generator: {opt.netG}")
-    logger.info(f"  Discriminator: {opt.netD}")
     logger.info(f"  GAN mode: {opt.gan_mode}")
-    logger.info(f"  Lambda A: {getattr(opt, 'lambda_A', 'N/A')}")
-    logger.info(f"  Lambda B: {getattr(opt, 'lambda_B', 'N/A')}")
-    logger.info(f"  Lambda identity: {getattr(opt, 'lambda_identity', 'N/A')}")
     logger.info("-" * 40)
     
     return logger
 
 
+def compute_val_metrics(fake, real):
+    """
+    Computes metrics between generated and real images.
+    Input tensors should be in range [-1, 1].
+    """
+    # 1. L1 Loss (MAE) - Good for optimization tracking
+    l1_loss = nn.L1Loss()(fake, real)
+    
+    # 2. PSNR - Good for medical image quality
+    # Convert to [0, 1] for PSNR calculation
+    fake_norm = (fake + 1) / 2.0
+    real_norm = (real + 1) / 2.0
+    mse = nn.MSELoss()(fake_norm, real_norm)
+    if mse == 0:
+        psnr = 100
+    else:
+        psnr = 20 * torch.log10(1.0 / torch.sqrt(mse))
+        
+    return l1_loss, psnr
 
 
 if __name__ == "__main__":
-    opt = TrainOptions().parse()  # get training options
+    opt = TrainOptions().parse()
     opt.device = init_ddp()
     
     # Setup logging
@@ -99,8 +105,7 @@ if __name__ == "__main__":
     patience = getattr(opt, 'patience', 50)
     use_validation = getattr(opt, 'use_validation', False)
     
-    # Create slice-based dataset: loads all NIfTI volumes, indexes individual slices
-    # This ensures every axial slice is seen during training (not just the middle one)
+    # Create slice-based datasets with diffusion-matched normalization
     logger.info("Loading training volumes and building slice index ...")
     train_ds = ColteaSliceDataset(train_csv, train_col, data_root)
     train_loader = DataLoader(
@@ -114,7 +119,7 @@ if __name__ == "__main__":
     dataset_size = len(train_ds)
     logger.info(f"The number of training slices = {dataset_size}")
     
-    # Create validation loader if enabled
+    # Create validation loader
     val_loader = None
     if use_validation and os.path.exists(val_csv):
         logger.info("Loading validation volumes ...")
@@ -128,9 +133,9 @@ if __name__ == "__main__":
         )
         logger.info(f"The number of validation slices = {len(val_ds)}")
 
-    model = create_model(opt)  # create a model given opt.model and other options
-    model.setup(opt)  # regular setup: load and print networks; create schedulers
-    visualizer = Visualizer(opt)  # create a visualizer that display/save images and plots
+    model = create_model(opt)
+    model.setup(opt)
+    visualizer = Visualizer(opt)
     
     total_iters = 0
     best_val_loss = float('inf')
@@ -151,16 +156,13 @@ if __name__ == "__main__":
         
         visualizer.reset()
 
-        # Progress bar for training
+        # --- TRAINING LOOP ---
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{total_epochs} [Train]")
         
         for batch in progress_bar:
             iter_start_time = time.time()
             
-            # ColteaSliceDataset already returns {"A", "B", "A_paths", "B_paths"}
-            # in [-1, 1] with shape (B, 1, H, W) — no adaptation needed
-            data = batch
-            
+            data = batch  # ColteaSliceDataset returns CycleGAN-ready format
             total_iters += opt.batch_size
             epoch_iter += opt.batch_size
             
@@ -173,7 +175,6 @@ if __name__ == "__main__":
             epoch_loss += batch_loss
             num_batches += 1
             
-            # Update progress bar
             progress_bar.set_postfix(loss=f"{batch_loss:.4f}")
 
             if total_iters % opt.display_freq == 0:
@@ -191,56 +192,72 @@ if __name__ == "__main__":
                 save_suffix = f"iter_{total_iters}" if opt.save_by_iter else "latest"
                 model.save_networks(save_suffix)
 
-        # Compute average training loss for epoch
+        # Average Training Loss
         avg_train_loss = epoch_loss / num_batches if num_batches > 0 else 0
-        
-        # Get current learning rate
         current_lr = model.optimizers[0].param_groups[0]['lr'] if model.optimizers else opt.lr
         
-        # Log detailed losses for this epoch
+        # Log Training Stats
         epoch_losses = model.get_current_losses()
         loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in epoch_losses.items()])
         logger.info(f"Epoch {epoch} Losses: {loss_str}")
         logger.info(f"Epoch {epoch} - Avg Train Loss: {avg_train_loss:.6f} | LR: {current_lr:.6f}")
         
-        # --- VALIDATION STEP ---
+        # --- VALIDATION LOOP ---
         if val_loader is not None:
             model.eval()
-            val_loss = 0.0
+            val_l1_loss = 0.0
+            val_psnr = 0.0
             val_batches = 0
             
             with torch.no_grad():
-                for batch in val_loader:
-                    data = batch  # Already in CycleGAN format from ColteaSliceDataset
-                    model.set_input(data)
-                    model.forward()
+                for batch in tqdm(val_loader, desc=f"Epoch {epoch} [Valid]", leave=False):
+                    model.set_input(batch)  # Already in CycleGAN format
+                    model.test()  # Generates fake_B (A->B)
                     
-                    losses = model.get_current_losses()
-                    val_loss += sum(losses.values())
+                    # Get images
+                    visuals = model.get_current_visuals()
+                    fake_B = visuals['fake_B']  # Generated Native
+                    real_B = visuals['real_B']  # Real Native
+                    
+                    # Compute metrics
+                    l1, psnr = compute_val_metrics(fake_B, real_B)
+                    
+                    val_l1_loss += l1.item()
+                    val_psnr += psnr.item()
                     val_batches += 1
             
-            model.train()
-            avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
+            # Switch back to train mode
+            for name in model.model_names:
+                if isinstance(name, str):
+                    getattr(model, "net" + name).train()
             
-            logger.info(f"Epoch {epoch} - Val Loss: {avg_val_loss:.6f}")
+            # Compute Averages
+            avg_val_l1 = val_l1_loss / val_batches if val_batches > 0 else 0
+            avg_val_psnr = val_psnr / val_batches if val_batches > 0 else 0
             
-            # Check for improvement
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            logger.info(f"Epoch {epoch} - Val L1 Loss: {avg_val_l1:.6f} | Val PSNR: {avg_val_psnr:.2f} dB")
+            
+            # Save Best Model Logic (Minimizing L1 Loss)
+            if avg_val_l1 < best_val_loss:
+                improvement = best_val_loss - avg_val_l1
+                best_val_loss = avg_val_l1
                 early_stopping_counter = 0
+                
                 model.save_networks('best')
-                logger.info(f" -> New Best Model Saved! (Val Loss: {best_val_loss:.6f})")
+                logger.info(f" -> New Best Model Saved! (L1: {best_val_loss:.6f})")
             else:
                 early_stopping_counter += 1
-                logger.info(f" -> No improvement. Early stopping counter: {early_stopping_counter}/{patience}")
+                logger.info(f" -> No improvement ({early_stopping_counter}/{patience})")
             
-            # Check early stopping
+            # Early Stopping
             if early_stopping_counter >= patience:
                 logger.info(f"Early stopping triggered after {epoch} epochs.")
                 break
 
+        # Update Learning Rate
         model.update_learning_rate()
 
+        # Regular Epoch Saving
         if epoch % opt.save_epoch_freq == 0:
             print(f"saving the model at the end of epoch {epoch}, iters {total_iters}")
             model.save_networks("latest")
@@ -249,8 +266,6 @@ if __name__ == "__main__":
         epoch_time = time.time() - epoch_start_time
         logger.info(f"End of epoch {epoch} / {total_epochs} \t Time Taken: {epoch_time:.0f} sec")
 
-    # Save final model
     model.save_networks('final')
     logger.info("Training completed. Final model saved.")
-    
     cleanup_ddp()
