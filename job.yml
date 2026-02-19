@@ -20,6 +20,7 @@ spec:
 
               # ──────────────────────────────────────────────────────────
               # Uncomment ONE args line below depending on what you need.
+              # Switch between models: --model cycle_gan  OR  --model pix2pix
               # CSV splits: defaults to train_data.csv / eval_data.csv / test_data.csv
               #   Add --train_csv / --val_csv / --test_csv to override, e.g.:
               #   --train_csv ../data/Coltea-Lung-CT-100W/clean_train_data.csv
@@ -27,35 +28,49 @@ spec:
               #   --test_csv ../data/Coltea-Lung-CT-100W/clean_test_data.csv
               # ──────────────────────────────────────────────────────────
 
-              args: ["-c", "python test.py \
-                    --dataroot ../data/Coltea_Processed_Nifti \
-                    --test_csv ../data/Coltea-Lung-CT-100W/test_data.csv \
-                    --name coltea_cyclegan_clean \
-                    --model cycle_gan \
-                    --input_nc 1 --output_nc 1 \
-                    --epoch best \
-                    --eval"
-                                        ]
+              args: ["-c", "# Train pix2pix
+                    python train_with_validation_checkpoints.py \
+                        --dataroot ../data/Coltea_Processed_Nifti_Registered \
+                        --name coltea_pix2pix_baseline --model pix2pix \
+                        --input_nc 1 --output_nc 1 \
+                        --n_epochs 100 --n_epochs_decay 100 \
+                        --batch_size 4 --use_validation --patience 30 --no_html"
+                                                            ]
 
-              # Option A — Retrain from scratch (registered data, new experiment name)
+              # ── CycleGAN Options ──
+
+              # Option A — CycleGAN: Retrain from scratch (registered data)
               #args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_retrain --model cycle_gan --input_nc 1 --output_nc 1 --n_epochs 1000 --n_epochs_decay 100 --batch_size 4 --use_validation --patience 100 --no_html"]
 
-              # Option A (clean CSVs) — Same but using quality-filtered patient lists
+              # Option A (clean CSVs) — CycleGAN with quality-filtered patient lists
               # args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Coltea_Processed_Nifti_Registered --train_csv ../data/Coltea-Lung-CT-100W/clean_train_data.csv --val_csv ../data/Coltea-Lung-CT-100W/clean_eval_data.csv --name coltea_cyclegan_clean --model cycle_gan --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100 --batch_size 4 --use_validation --patience 30 --no_html"]
 
-              # Option B — Resume training from checkpoint (change --epoch_count to the epoch to resume from)
+              # Option B — CycleGAN: Resume training from checkpoint
               # args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --continue_train --epoch_count 150 --n_epochs 100 --n_epochs_decay 100 --batch_size 4 --use_validation --patience 30 --no_html"]
 
-              # Option C — Test only (PSNR/SSIM metrics + visual grids)
+              # Option C — CycleGAN: Test only (PSNR/SSIM metrics + visual grids)
               # args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --epoch latest --eval"]
 
-              # Option C (clean CSVs) — Test using clean test split
+              # Option C (clean CSVs) — CycleGAN: Test using clean test split
               # args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered --test_csv ../data/Coltea-Lung-CT-100W/clean_test_data.csv --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --epoch latest --eval"]
 
-              # Option D — Inference + 3D stitching (for model comparison, no post-processing)
+              # Option D — CycleGAN: Inference + 3D stitching (no post-processing)
               #args: ["-c", "python inference_and_stitch.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --epoch latest --eval"]
 
-              # Option E — Compare CycleGAN vs Diffusion (PSNR, SSIM, FID)
+              # ── pix2pix Options ──
+
+              # Option A — pix2pix: Train from scratch (registered data)
+              # args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100 --batch_size 4 --use_validation --patience 30 --no_html"]
+
+              # Option C — pix2pix: Test only (PSNR/SSIM metrics + visual grids)
+              # args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --epoch best --eval"]
+
+              # Option D — pix2pix: Inference + 3D stitching (no post-processing)
+              # args: ["-c", "python inference_and_stitch.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --epoch best --eval"]
+
+              # ── Shared Options ──
+
+              # Option E — Compare GAN vs Diffusion (PSNR, SSIM, FID)
               # args: ["-c", "python compare_models.py --diffusion_dir ../ctpa_medvae_latent_diffusion/predictions_medvae_ldm/ --cyclegan_dir ./results/coltea_cyclegan_with_val/stitched_3d_epoch_latest/ --gt_from_cyclegan --compute_fid --output_dir ./comparison_results/"]
 
               # Option F — Plot training loss curves

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Honest 3D Inference for CycleGAN Baseline.
+Honest 3D Inference for GAN Baselines (CycleGAN / pix2pix).
 
 Takes a reserved test set of 3D NIfTI volumes, breaks each into 2D axial
-slices, runs CycleGAN inference on each slice *independently*, and stitches
+slices, runs the model inference on each slice *independently*, and stitches
 them back into a 3D volume.
 
 Constraint: NO post-processing smoothing (no Gaussian blur, no 3D consistency
@@ -12,18 +12,20 @@ artifacts or Z-inconsistencies are preserved honestly.
 
 Normalization:
     Input:  NIfTI loaded and windowed to [-1000, 1000] HU -> [0, 1] -> [-1, 1]
-    Output: CycleGAN outputs in [-1, 1], converted back to [0, 1] for saving.
-    Both diffusion and CycleGAN outputs end up in [0, 1] for fair comparison.
+    Output: Model outputs in [-1, 1], converted back to [0, 1] for saving.
+    Both diffusion and GAN outputs end up in [0, 1] for fair comparison.
 
-Usage:
+Usage (CycleGAN):
     python inference_and_stitch.py \
         --dataroot ../data/Coltea_Processed_Nifti_Registered \
-        --test_csv ../data/Coltea-Lung-CT-100W/test_data.csv \
-        --test_col patient_id \
-        --name coltea_cyclegan_baseline \
-        --epoch best \
-        --output_dir ./results/cyclegan_3d_volumes \
-        --input_nc 1 --output_nc 1
+        --name coltea_cyclegan_baseline --model cycle_gan \
+        --input_nc 1 --output_nc 1 --epoch best --eval
+
+Usage (pix2pix):
+    python inference_and_stitch.py \
+        --dataroot ../data/Coltea_Processed_Nifti_Registered \
+        --name coltea_pix2pix_baseline --model pix2pix \
+        --input_nc 1 --output_nc 1 --epoch best --eval
 """
 
 import os
@@ -68,10 +70,10 @@ def process_volume(
     device: torch.device,
 ) -> np.ndarray:
     """
-    Process a single 3D volume slice-by-slice through CycleGAN.
+    Process a single 3D volume slice-by-slice through the model.
 
     Args:
-        model: Loaded CycleGAN model (in eval mode).
+        model: Loaded model (CycleGAN or pix2pix) in eval mode.
         source_vol: (1, H, W, D) tensor in [0, 1] from ColteaPairedDataset3D.
         target_vol: (1, H, W, D) tensor in [0, 1] (used as dummy B input).
         device: CUDA / CPU device.
@@ -87,7 +89,7 @@ def process_volume(
         src_slice = source_vol[:, :, :, d].unsqueeze(0)  # (1, 1, H, W)
         tgt_slice = target_vol[:, :, :, d].unsqueeze(0)
 
-        # [0, 1] -> [-1, 1] for CycleGAN
+        # [0, 1] -> [-1, 1] for GAN model input
         src_slice = _normalize_to_neg1_pos1(src_slice)
         tgt_slice = _normalize_to_neg1_pos1(tgt_slice)
 
@@ -115,7 +117,6 @@ def process_volume(
 
 
 def main():
-    # Parse CycleGAN test options
     opt = TestOptions().parse()
     opt.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -136,8 +137,10 @@ def main():
     )
     os.makedirs(output_dir, exist_ok=True)
 
+    model_tag = opt.model.replace("_", "")  # e.g. "cyclegan" or "pix2pix"
+
     logger.info("=" * 60)
-    logger.info("CycleGAN 3D Inference & Stitch (HONEST — no post-processing)")
+    logger.info(f"{opt.model} 3D Inference & Stitch (HONEST — no post-processing)")
     logger.info("=" * 60)
     logger.info(f"Checkpoint: {opt.name}, epoch: {opt.epoch}")
     logger.info(f"Data root:  {data_root}")
@@ -177,7 +180,7 @@ def main():
             # Save NIfTI volumes
             nib.save(
                 nib.Nifti1Image(gen_vol.astype(np.float32), affine=np.eye(4)),
-                os.path.join(output_dir, f"{patient_id}_cyclegan_pred.nii.gz"),
+                os.path.join(output_dir, f"{patient_id}_{model_tag}_pred.nii.gz"),
             )
             nib.save(
                 nib.Nifti1Image(gt_vol.astype(np.float32), affine=np.eye(4)),

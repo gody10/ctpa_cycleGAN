@@ -1,12 +1,17 @@
-"""Test script for CycleGAN baseline with data-parity normalization.
+"""Test script for GAN baselines (CycleGAN / pix2pix) with data-parity normalization.
 
 Processes full 3D volumes slice-by-slice and computes metrics.
 Uses the same fixed HU windowing [-1000, 1000] as the diffusion model.
 
-Example:
+Example (CycleGAN):
     python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered \
         --name coltea_cyclegan_baseline --model cycle_gan \
-        --input_nc 1 --output_nc 1 --epoch best
+        --input_nc 1 --output_nc 1 --epoch best --eval
+
+Example (pix2pix):
+    python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered \
+        --name coltea_pix2pix_baseline --model pix2pix \
+        --input_nc 1 --output_nc 1 --epoch best --eval
 """
 
 import os
@@ -162,7 +167,7 @@ def test_full_volume(model, source_vol, target_vol, opt, patient_id, output_dir)
     volume-level metrics can be displayed in the suptitle.
 
     Args:
-        model: CycleGAN model in eval mode.
+        model: Model (CycleGAN or pix2pix) in eval mode.
         source_vol: (1, H, W, D) tensor in [0, 1].
         target_vol: (1, H, W, D) tensor in [0, 1].
         opt: Options object.
@@ -258,7 +263,7 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"=" * 60)
-    print(f"CycleGAN Testing - {opt.name}")
+    print(f"{opt.model} Testing - {opt.name}")
     print(f"=" * 60)
     print(f"Loading model from epoch: {opt.epoch}")
     print(f"Output directory: {output_dir}")
@@ -312,13 +317,15 @@ if __name__ == "__main__":
                       f"RMSE={metrics_dict['rmse']:.4f}")
 
                 # Save NIfTI volumes
+                volumes_dir = os.path.join(output_dir, "volumes")
+                os.makedirs(volumes_dir, exist_ok=True)
                 nib.save(
                     nib.Nifti1Image(generated_vol.astype(np.float32), affine=np.eye(4)),
-                    os.path.join(output_dir, f"{patient_id}_pred.nii.gz")
+                    os.path.join(volumes_dir, f"{patient_id}_pred.nii.gz")
                 )
                 nib.save(
                     nib.Nifti1Image(gt_vol.astype(np.float32), affine=np.eye(4)),
-                    os.path.join(output_dir, f"{patient_id}_ground_truth.nii.gz")
+                    os.path.join(volumes_dir, f"{patient_id}_ground_truth.nii.gz")
                 )
 
             except Exception as e:
@@ -373,5 +380,5 @@ if __name__ == "__main__":
     print(f"  > Metrics CSV:  metrics.csv")
     print(f"  > Metrics JSON: test_results.json")
     print(f"  > Images:       slices/ directory")
-    print(f"  > Volumes:      .nii.gz files")
+    print(f"  > Volumes:      volumes/ directory")
     print("=" * 60)

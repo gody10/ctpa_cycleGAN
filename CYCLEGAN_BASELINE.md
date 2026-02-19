@@ -1,8 +1,32 @@
-# CycleGAN Baseline for CTPA Image Translation
+# GAN Baselines for CTPA Image Translation
 
-> **Purpose**: Fair, unmodified 2D CycleGAN baseline for comparison against the novel 3D Latent Diffusion model (`ctpa_medvae_latent_diffusion`).
+> **Purpose**: Fair, unmodified 2D GAN baselines (CycleGAN and pix2pix) for comparison against the novel 3D Latent Diffusion model (`ctpa_medvae_latent_diffusion`).
 >
-> **Philosophy**: Do not optimize CycleGAN to win. If it produces striping artifacts or 3D inconsistencies because it processes data slice-by-slice, let it happen. That is exactly the limitation being demonstrated.
+> **Philosophy**: Do not optimize the GAN baselines to win. If they produce striping artifacts or 3D inconsistencies because they process data slice-by-slice, let it happen. That is exactly the limitation being demonstrated.
+
+---
+
+## Choosing a Model
+
+Both models are available via the `--model` flag:
+
+| Flag | Model | Training Data | Key Difference |
+|------|-------|---------------|----------------|
+| `--model cycle_gan` | CycleGAN | Unpaired (uses cycle-consistency) | Two generators (A→B, B→A), no paired supervision needed |
+| `--model pix2pix` | pix2pix | Paired (supervised L1 + GAN) | One generator (A→B), conditional discriminator, direct L1 loss |
+
+Both models share the same training, testing, and inference scripts. Just change `--model` and `--name`.
+
+### Default architectures (matching the original papers)
+
+| Setting | CycleGAN | pix2pix |
+|---------|----------|---------|
+| Generator (`--netG`) | `resnet_9blocks` | `unet_256` |
+| Normalization (`--norm`) | `instance` | `instance` |
+| GAN loss (`--gan_mode`) | `lsgan` | `vanilla` |
+| Image buffer (`--pool_size`) | 50 | 0 |
+| Discriminator | Unconditional PatchGAN | Conditional PatchGAN (input+output) |
+| Supervised loss | Cycle L1 (λ=10) + Identity L1 | Direct L1 (λ=100) |
 
 ---
 
@@ -10,10 +34,16 @@
 
 All commands are run via Kubernetes. Edit the `args` line in `job.yml`, then submit with `kubectl create -f job.yml`.
 
-### Option A: Retrain from scratch
+### Option A: Train from scratch
 
+**CycleGAN:**
 ```yaml
 args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_retrain --model cycle_gan --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100 --batch_size 4 --use_validation --patience 30 --no_html"]
+```
+
+**pix2pix:**
+```yaml
+args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100 --batch_size 4 --use_validation --patience 30 --no_html"]
 ```
 
 ### Option B: Resume training from a checkpoint
@@ -24,21 +54,33 @@ args: ["-c", "python train_with_validation_checkpoints.py --dataroot ../data/Col
 
 ### Option C: Test only (PSNR/SSIM metrics + visual grids)
 
+**CycleGAN:**
 ```yaml
 args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --epoch latest --eval"]
 ```
 
-Output: `results/coltea_cyclegan_with_val/test_latest/` — per-patient NIfTI predictions, PNG comparison grids, `metrics.csv`.
+**pix2pix:**
+```yaml
+args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --epoch latest --eval"]
+```
+
+Output: `results/{name}/test_{epoch}/` — per-patient NIfTI predictions, PNG comparison grids, `metrics.csv`.
 
 ### Option D: Inference + 3D stitching (for model comparison)
 
+**CycleGAN:**
 ```yaml
 args: ["-c", "python inference_and_stitch.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_with_val --model cycle_gan --input_nc 1 --output_nc 1 --epoch latest --eval"]
 ```
 
-Output: `results/coltea_cyclegan_with_val/stitched_3d_epoch_latest/` — raw stitched NIfTI volumes (no post-processing).
+**pix2pix:**
+```yaml
+args: ["-c", "python inference_and_stitch.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --epoch latest --eval"]
+```
 
-### Option E: Compare CycleGAN vs Diffusion
+Output: `results/{name}/stitched_3d_epoch_{epoch}/` — raw stitched NIfTI volumes (no post-processing).
+
+### Option E: Compare GAN vs Diffusion
 
 ```yaml
 args: ["-c", "python compare_models.py --diffusion_dir ../ctpa_medvae_latent_diffusion/predictions_medvae_ldm/ --cyclegan_dir ./results/coltea_cyclegan_with_val/stitched_3d_epoch_latest/ --gt_from_cyclegan --compute_fid --output_dir ./comparison_results/"]
@@ -104,24 +146,25 @@ kubectl logs <pod-name> -f        # Stream logs
 
 ## 1. Project Overview
 
-This is a fork of the [original CycleGAN](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix) adapted for medical CT image translation:
+This is a fork of the [original CycleGAN and pix2pix](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix) adapted for medical CT image translation:
 
 - **Task**: Arterial (contrast) CT → Native (non-contrast) CT
 - **Data**: Coltea-Lung-CT-100W dataset (paired NIfTI volumes)
+- **Models**: CycleGAN (`--model cycle_gan`) and pix2pix (`--model pix2pix`)
 - **Training**: 2D axial slices, extracted from 3D volumes
 - **Inference**: Slice-by-slice processing, stitched back into 3D — **no post-processing**
 
-The CycleGAN serves as a **classical 2D baseline** to highlight the advantages of 3D latent diffusion for volumetric medical image translation.
+These serve as **classical 2D baselines** to highlight the advantages of 3D latent diffusion for volumetric medical image translation.
 
 ---
 
 ## 2. Data Parity
 
-Both models see **exactly the same data distribution**. This is the most critical aspect of the baseline.
+All models see **exactly the same data distribution**. This is the most critical aspect of the baselines.
 
 ### Normalization Contract
 
-| Parameter              | CycleGAN (`dataset.py`)      | Diffusion (`src/dataset.py`) |
+| Parameter              | GAN Baselines (`dataset.py`) | Diffusion (`src/dataset.py`) |
 |------------------------|------------------------------|------------------------------|
 | HU window min          | **-1000**                    | **-1000**                    |
 | HU window max          | **+1000**                    | **+1000**                    |
@@ -132,12 +175,12 @@ Both models see **exactly the same data distribution**. This is the most critica
 | Orientation            | RAS                          | RAS                          |
 | Intensity transform    | `ScaleIntensityRanged` (MONAI) | `ScaleIntensityRanged` (MONAI) |
 
-### What is NOT added to CycleGAN
+### What is NOT added to the GAN baselines
 
-- ❌ Body-mask-biased cropping (diffusion uses it, CycleGAN does not — this is intentional)
-- ❌ Elastic deformations
-- ❌ Flipping or rotation augmentations
-- ❌ Any data augmentation not present in the diffusion model
+- Body-mask-biased cropping (diffusion uses it, GANs do not — this is intentional)
+- Elastic deformations
+- Flipping or rotation augmentations
+- Any data augmentation not present in the diffusion model
 
 ### Data Directories
 
@@ -168,9 +211,11 @@ CSV format (column: `patient_id`):
 
 ## 3. Architecture
 
-This is a **vanilla, unmodified CycleGAN**. No enhancements have been added.
+### CycleGAN (`--model cycle_gan`)
 
-### Generator: ResNet-9blocks
+Vanilla, unmodified CycleGAN. No enhancements have been added.
+
+**Generator: ResNet-9blocks** (two generators: G_A and G_B)
 
 ```
 Input → ReflPad(3) → Conv(7,64) → IN → ReLU
@@ -182,17 +227,9 @@ Input → ReflPad(3) → Conv(7,64) → IN → ReLU
   → ReflPad(3) → Conv(7,out) → Tanh
 ```
 
-### Discriminator: 70×70 PatchGAN
+**Discriminator: 70×70 PatchGAN** (unconditional, two discriminators: D_A and D_B)
 
-```
-Input → Conv(4,64,stride=2) → LeakyReLU(0.2)
-  → Conv(4,128,stride=2) → IN → LeakyReLU(0.2)
-  → Conv(4,256,stride=2) → IN → LeakyReLU(0.2)
-  → Conv(4,512,stride=1) → IN → LeakyReLU(0.2)
-  → Conv(4,1,stride=1)
-```
-
-### Loss Functions
+**Loss Functions:**
 
 | Loss                | Type     | Weight |
 |---------------------|----------|--------|
@@ -202,11 +239,43 @@ Input → Conv(4,64,stride=2) → LeakyReLU(0.2)
 | Identity G_A(B)≈B  | L1       | λ_idt × λ_B = 5.0 |
 | Identity G_B(A)≈A  | L1       | λ_idt × λ_A = 5.0 |
 
-### Optimizer
+**Optimizer:** Adam (lr=0.0002, β1=0.5, β2=0.999), linear LR decay, image buffer pool_size=50.
 
-- Adam (lr=0.0002, β1=0.5, β2=0.999)
-- Linear LR decay to 0 over the second half of training
-- Image history buffer: pool_size=50
+### pix2pix (`--model pix2pix`)
+
+Vanilla, unmodified pix2pix. No enhancements have been added.
+
+**Generator: UNet-256** (one generator: G)
+
+```
+Input → Encoder (8 downsampling layers with skip connections)
+  → Decoder (8 upsampling layers with skip connections from encoder)
+  → Tanh
+```
+
+**Discriminator: 70×70 PatchGAN** (conditional — takes concatenated input+output)
+
+**Loss Functions:**
+
+| Loss                | Type     | Weight |
+|---------------------|----------|--------|
+| GAN G(A)            | Vanilla (BCE) | 1.0 |
+| L1 ‖G(A) − B‖      | L1       | λ_L1 = 100.0 |
+
+**Optimizer:** Adam (lr=0.0002, β1=0.5, β2=0.999), linear LR decay, no image buffer (pool_size=0).
+
+### Shared Discriminator Architecture
+
+Both use the same 70×70 PatchGAN discriminator:
+```
+Input → Conv(4,64,stride=2) → LeakyReLU(0.2)
+  → Conv(4,128,stride=2) → IN → LeakyReLU(0.2)
+  → Conv(4,256,stride=2) → IN → LeakyReLU(0.2)
+  → Conv(4,512,stride=1) → IN → LeakyReLU(0.2)
+  → Conv(4,1,stride=1)
+```
+
+Note: pix2pix feeds `cat(input, output)` to D (conditional), while CycleGAN feeds output alone (unconditional).
 
 ---
 
@@ -219,7 +288,7 @@ ctpa_cycleGAN/
 ├── train_with_validation_checkpoints.py← Training with val L1/PSNR + early stopping
 ├── test.py                             ← Test: slice-by-slice 3D inference + metrics
 ├── inference_and_stitch.py             ← Honest 3D stitching (no post-processing)
-├── compare_models.py                   ← Standalone eval: Diffusion vs CycleGAN
+├── compare_models.py                   ← Standalone eval: Diffusion vs GAN baselines
 ├── plot_losses.py                      ← Loss curve visualization
 ├── Dockerfile                          ← Container build
 ├── job.yml                             ← Kubernetes job spec (EIDF H100)
@@ -228,6 +297,7 @@ ctpa_cycleGAN/
 │
 ├── models/
 │   ├── cycle_gan_model.py              ← CycleGAN model (losses, forward, backward)
+│   ├── pix2pix_model.py                ← pix2pix model (losses, forward, backward)
 │   ├── networks.py                     ← Generator/Discriminator architectures
 │   └── base_model.py                   ← Base class (save/load, DDP)
 │
@@ -236,11 +306,11 @@ ctpa_cycleGAN/
 │   ├── train_options.py                ← Training-specific options
 │   └── test_options.py                 ← Test-specific options
 │
-├── data/                               ← Original CycleGAN data loaders (not used)
+├── data/                               ← Original data loaders (not used)
 ├── util/                               ← Visualization, image pool, utilities
 ├── checkpoints/                        ← Saved model weights
-│   ├── coltea_cyclegan/                ← Previous training run
-│   └── coltea_cyclegan_with_val/       ← Previous run with validation
+│   ├── coltea_cyclegan/                ← Previous CycleGAN training run
+│   └── coltea_cyclegan_with_val/       ← Previous CycleGAN run with validation
 └── results/                            ← Test/inference outputs
 ```
 
@@ -248,7 +318,7 @@ ctpa_cycleGAN/
 
 ## 5. Dataset Classes
 
-All defined in `dataset.py`:
+All defined in `dataset.py`. Both CycleGAN and pix2pix use the same datasets — the data format `{"A", "B", "A_paths", "B_paths"}` is shared.
 
 ### `ColteaSliceDataset` — For Training
 
@@ -281,6 +351,7 @@ LoadNIfTI → EnsureChannelFirst → Reorient(RAS) → ScaleIntensity[-1000,1000
 
 ### Basic Training
 
+**CycleGAN:**
 ```bash
 python train.py \
     --dataroot ../data/Coltea_Processed_Nifti_Registered \
@@ -293,19 +364,34 @@ python train.py \
     --no_html
 ```
 
+**pix2pix:**
+```bash
+python train.py \
+    --dataroot ../data/Coltea_Processed_Nifti_Registered \
+    --name coltea_pix2pix_baseline \
+    --model pix2pix \
+    --input_nc 1 --output_nc 1 \
+    --n_epochs 100 --n_epochs_decay 100 \
+    --batch_size 4 \
+    --save_epoch_freq 5 \
+    --no_html
+```
+
 ### Training with Validation + Early Stopping
 
 ```bash
 python train_with_validation_checkpoints.py \
     --dataroot ../data/Coltea_Processed_Nifti_Registered \
-    --name coltea_cyclegan_baseline \
-    --model cycle_gan \
+    --name coltea_pix2pix_baseline \
+    --model pix2pix \
     --input_nc 1 --output_nc 1 \
     --n_epochs 100 --n_epochs_decay 100 \
     --batch_size 4 \
     --use_validation --patience 30 \
     --no_html
 ```
+
+(Replace `--model pix2pix` with `--model cycle_gan` and adjust `--name` for CycleGAN.)
 
 ### Resume from Checkpoint
 
@@ -322,40 +408,66 @@ python train.py \
 
 ### Key Training Options
 
+**Shared options (both models):**
+
 | Flag | Description | Default |
 |------|-------------|---------|
+| `--model` | Model type | `cycle_gan` |
 | `--train_csv` | Path to training split CSV | `../data/Coltea-Lung-CT-100W/train_data.csv` |
 | `--val_csv` | Path to validation split CSV | `../data/Coltea-Lung-CT-100W/eval_data.csv` |
 | `--test_csv` | Path to test split CSV | `../data/Coltea-Lung-CT-100W/test_data.csv` |
 | `--csv_column` | Column name for patient IDs | `patient_id` |
 | `--input_nc` | Input channels (1 for grayscale CT) | 3 |
 | `--output_nc` | Output channels | 3 |
-| `--netG` | Generator architecture | `resnet_9blocks` |
+| `--netG` | Generator architecture | `resnet_9blocks` (CycleGAN) / `unet_256` (pix2pix) |
 | `--netD` | Discriminator architecture | `basic` (PatchGAN) |
 | `--ngf` | Generator base filters | 64 |
 | `--ndf` | Discriminator base filters | 64 |
-| `--gan_mode` | GAN loss type | `lsgan` |
 | `--n_epochs` | Constant LR epochs | 100 |
 | `--n_epochs_decay` | Linear decay epochs | 100 |
 | `--lr` | Learning rate | 0.0002 |
 | `--batch_size` | Batch size (slices) | 1 |
-| `--lambda_A` | Cycle loss weight (A→B→A) | 10.0 |
-| `--lambda_B` | Cycle loss weight (B→A→B) | 10.0 |
-| `--lambda_identity` | Identity loss scale | 0.5 |
-| `--pool_size` | Image buffer size | 50 |
 | `--save_epoch_freq` | Save every N epochs | 5 |
 | `--use_validation` | Enable validation loop | off |
 | `--patience` | Early stopping patience | 50 |
 | `--no_html` | Disable HTML visualizer | off |
 
+**CycleGAN-specific options:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--gan_mode` | GAN loss type | `lsgan` |
+| `--lambda_A` | Cycle loss weight (A→B→A) | 10.0 |
+| `--lambda_B` | Cycle loss weight (B→A→B) | 10.0 |
+| `--lambda_identity` | Identity loss scale | 0.5 |
+| `--pool_size` | Image buffer size | 50 |
+
+**pix2pix-specific options:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--gan_mode` | GAN loss type | `vanilla` |
+| `--lambda_L1` | L1 reconstruction weight | 100.0 |
+| `--pool_size` | Image buffer size | 0 |
+
 ### Checkpoints
 
 Saved to `./checkpoints/{name}/`:
+
+**CycleGAN:**
 ```
 {epoch}_net_G_A.pth    ← Generator A→B
 {epoch}_net_G_B.pth    ← Generator B→A
 {epoch}_net_D_A.pth    ← Discriminator A
 {epoch}_net_D_B.pth    ← Discriminator B
+best_net_*.pth         ← Best validation model (if --use_validation)
+latest_net_*.pth       ← Most recent
+```
+
+**pix2pix:**
+```
+{epoch}_net_G.pth      ← Generator A→B
+{epoch}_net_D.pth      ← Discriminator
 best_net_*.pth         ← Best validation model (if --use_validation)
 latest_net_*.pth       ← Most recent
 ```
@@ -369,12 +481,14 @@ latest_net_*.pth       ← Most recent
 ```bash
 python test.py \
     --dataroot ../data/Coltea_Processed_Nifti_Registered \
-    --name coltea_cyclegan_baseline \
-    --model cycle_gan \
+    --name coltea_pix2pix_baseline \
+    --model pix2pix \
     --input_nc 1 --output_nc 1 \
     --epoch best \
     --eval
 ```
+
+(Replace `--model pix2pix` / `--name` for CycleGAN.)
 
 **Output** (`./results/{name}/test_{epoch}/`):
 - `{patient_id}_pred.nii.gz` — Generated volume
@@ -387,15 +501,15 @@ python test.py \
 ```bash
 python inference_and_stitch.py \
     --dataroot ../data/Coltea_Processed_Nifti_Registered \
-    --name coltea_cyclegan_baseline \
-    --model cycle_gan \
+    --name coltea_pix2pix_baseline \
+    --model pix2pix \
     --input_nc 1 --output_nc 1 \
     --epoch best \
     --eval
 ```
 
 **Output** (`./results/{name}/stitched_3d_epoch_{epoch}/`):
-- `{patient_id}_cyclegan_pred.nii.gz` — Raw stitched prediction
+- `{patient_id}_{model}_pred.nii.gz` — Raw stitched prediction (e.g. `_pix2pix_pred` or `_cyclegan_pred`)
 - `{patient_id}_ground_truth.nii.gz` — Ground truth
 - `{patient_id}_source.nii.gz` — Source (arterial)
 - `inference_manifest.csv` — Status log
@@ -474,7 +588,7 @@ docker push gody10/cycle:latest
 Edit `job.yml` to set the desired command:
 
 ```yaml
-args: ["-c", "python train.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_baseline --model cycle_gan --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100 --batch_size 4 --no_html"]
+args: ["-c", "python train.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100 --batch_size 4 --no_html"]
 ```
 
 Then:
@@ -487,12 +601,12 @@ kubectl logs <pod-name> -f        # Stream logs
 ### Submit Inference Job
 
 ```yaml
-args: ["-c", "python inference_and_stitch.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_cyclegan_baseline --model cycle_gan --input_nc 1 --output_nc 1 --epoch best --eval"]
+args: ["-c", "python inference_and_stitch.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --epoch best --eval"]
 ```
 
 ### Resources
 
-The job spec requests **1× NVIDIA H100 80GB**, 20 CPU cores, 64 GB RAM.
+The job spec requests **1× NVIDIA H100 80GB**, 10 CPU cores, 64 GB RAM.
 
 ---
 
@@ -505,10 +619,11 @@ The job spec requests **1× NVIDIA H100 80GB**, 20 CPU cores, 64 GB RAM.
 | `train_with_validation_checkpoints.py` | Training with validation L1/PSNR tracking, best-model saving, early stopping. |
 | `test.py` | Slice-by-slice 3D inference with PSNR/SSIM metrics and visual grids. |
 | `inference_and_stitch.py` | Honest 3D reconstruction — no post-processing. Outputs NIfTI volumes for comparison. |
-| `compare_models.py` | Standalone evaluation: compares Diffusion vs CycleGAN on PSNR, SSIM, FID. |
+| `compare_models.py` | Standalone evaluation: compares Diffusion vs GAN baselines on PSNR, SSIM, FID. |
 | `plot_losses.py` | Reads training logs and plots loss curves. |
 | `models/cycle_gan_model.py` | CycleGAN model: forward pass, losses, optimization. |
-| `models/networks.py` | ResNet generator, PatchGAN discriminator definitions. |
+| `models/pix2pix_model.py` | pix2pix model: forward pass, losses, optimization. |
+| `models/networks.py` | ResNet/UNet generators, PatchGAN discriminator definitions. |
 | `options/base_options.py` | Shared CLI argument definitions. |
 
 ---
@@ -540,7 +655,7 @@ The job spec requests **1× NVIDIA H100 80GB**, 20 CPU cores, 64 GB RAM.
 
 ## 12. Completed Training Runs
 
-### `coltea_cyclegan_with_val` (recommended)
+### `coltea_cyclegan_with_val` (recommended CycleGAN)
 
 - **Completed**: 2026-01-20, all 200 epochs (100 constant LR + 100 linear decay)
 - **Data**: `../data/Coltea_Processed_Nifti` (unregistered), CSV splits from `../data/Coltea-Lung-CT-100W/`
@@ -556,4 +671,4 @@ The job spec requests **1× NVIDIA H100 80GB**, 20 CPU cores, 64 GB RAM.
 - **Config**: Standard training without validation tracking
 - **Checkpoints**: `checkpoints/coltea_cyclegan/`
 
-> **Note**: Both runs used the **unregistered** data (`Coltea_Processed_Nifti`). If you want to retrain on the **registered** data (`Coltea_Processed_Nifti_Registered`), use Option A from Quick Start with a new `--name` to avoid overwriting.
+> **Note**: Both CycleGAN runs used the **unregistered** data (`Coltea_Processed_Nifti`). If you want to retrain on the **registered** data (`Coltea_Processed_Nifti_Registered`), use Option A from Quick Start with a new `--name` to avoid overwriting.

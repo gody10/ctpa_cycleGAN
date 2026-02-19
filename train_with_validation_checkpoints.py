@@ -1,7 +1,8 @@
-"""Training script for CycleGAN baseline with validation checkpoints.
+"""Training script for GAN baselines (CycleGAN / pix2pix) with validation checkpoints.
 
 Uses ColteaSliceDataset with diffusion-matched HU windowing [-1000, 1000].
 Includes validation loop with L1 + PSNR tracking and best-model saving.
+Select model with --model cycle_gan or --model pix2pix.
 """
 
 import time
@@ -162,7 +163,7 @@ if __name__ == "__main__":
         for batch in progress_bar:
             iter_start_time = time.time()
             
-            data = batch  # ColteaSliceDataset returns CycleGAN-ready format
+            data = batch
             total_iters += opt.batch_size
             epoch_iter += opt.batch_size
             
@@ -211,7 +212,7 @@ if __name__ == "__main__":
             
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc=f"Epoch {epoch} [Valid]", leave=False):
-                    model.set_input(batch)  # Already in CycleGAN format
+                    model.set_input(batch)
                     model.test()  # Generates fake_B (A->B)
                     
                     # Get images

@@ -1,15 +1,18 @@
-"""Training script for CycleGAN baseline with data-parity to 3D Latent Diffusion.
+"""Training script for GAN baselines (CycleGAN / pix2pix) with data-parity to 3D Latent Diffusion.
 
 Uses ColteaSliceDataset which:
   - Loads NIfTI volumes with fixed HU windowing [-1000, 1000] (matches diffusion model)
   - Extracts ALL 2D axial slices (not just the middle slice)
-  - Returns slices in [-1, 1] ready for CycleGAN
+  - Returns slices in [-1, 1] ready for the model
 
-Architecture: vanilla ResNet-9blocks generator + 70x70 PatchGAN discriminator.
-
-Example:
+Example (CycleGAN):
     python train.py --dataroot ../data/Coltea_Processed_Nifti_Registered \
         --name coltea_cyclegan_baseline --model cycle_gan \
+        --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100
+
+Example (pix2pix):
+    python train.py --dataroot ../data/Coltea_Processed_Nifti_Registered \
+        --name coltea_pix2pix_baseline --model pix2pix \
         --input_nc 1 --output_nc 1 --n_epochs 100 --n_epochs_decay 100
 """
 
@@ -211,7 +214,7 @@ if __name__ == "__main__":
             
             with torch.no_grad():
                 for batch in val_loader:
-                    data = batch  # Already in CycleGAN format from ColteaSliceDataset
+                    data = batch
                     model.set_input(data)
                     model.forward()
                     
