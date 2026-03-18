@@ -64,6 +64,10 @@ args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registere
 args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --epoch latest --eval"]
 ```
 
+Add `--subtraction_eval` to also compute subtraction metrics (Sub PSNR/SSIM/MAE/RMSE)
+and generate 3-view subtraction visualizations. Add `--save_subtractions` to save
+subtraction NIfTI volumes denormalized to HU.
+
 Output: `results/{name}/test_{epoch}/` — per-patient NIfTI predictions, PNG comparison grids, `metrics.csv`.
 
 ### Option D: Inference + 3D stitching (for model comparison)
@@ -490,11 +494,32 @@ python test.py \
 
 (Replace `--model pix2pix` / `--name` for CycleGAN.)
 
+**With subtraction evaluation:**
+
+```bash
+python test.py \
+    --dataroot ../data/Coltea_Processed_Nifti_Registered \
+    --name coltea_pix2pix_baseline \
+    --model pix2pix \
+    --input_nc 1 --output_nc 1 \
+    --epoch best \
+    --eval \
+    --subtraction_eval \
+    --save_subtractions
+```
+
+| Flag | Description |
+|------|-------------|
+| `--subtraction_eval` | Enable subtraction evaluation and visualization |
+| `--save_subtractions` | Save subtraction NIfTI volumes (source − generated, source − ground_truth) in HU |
+
 **Output** (`./results/{name}/test_{epoch}/`):
-- `{patient_id}_pred.nii.gz` — Generated volume
-- `{patient_id}_ground_truth.nii.gz` — GT volume
-- `slices/` — PNG comparison grids at 25%, 50%, 75% depth
-- `metrics.csv` — Per-patient PSNR and SSIM
+- `volumes/{patient_id}_pred.nii.gz` — Generated volume
+- `volumes/{patient_id}_ground_truth.nii.gz` — GT volume
+- `visualizations/` — Multi-slice, 3-view, and subtraction comparison PNGs
+- `metrics.csv` — Per-patient PSNR, SSIM, MAE, RMSE (and Sub metrics if `--subtraction_eval`)
+- `test_results.json` — Summary statistics (mean ± std)
+- `subtractions/` — (if `--save_subtractions`) Subtraction NIfTI volumes in HU
 
 ### Honest 3D Stitching (for model comparison)
 
@@ -568,7 +593,14 @@ comparison_results/
 |--------|-------|-------------|
 | **PSNR** | [0, 1] volumes | Peak Signal-to-Noise Ratio (higher is better) |
 | **SSIM** | [0, 1] volumes | Structural Similarity, computed per-axial-slice then averaged (higher is better) |
+| **MAE** | [0, 1] volumes | Mean Absolute Error (lower is better) |
+| **RMSE** | [0, 1] volumes | Root Mean Squared Error (lower is better) |
 | **FID** | 2D slices → Inception features | Fréchet Inception Distance (lower is better, optional) |
+
+**Subtraction metrics** (with `--subtraction_eval` in `test.py`): compares
+`(source − generated)` vs `(source − ground_truth)`, computing Sub PSNR, Sub SSIM,
+Sub MAE, Sub RMSE. These measure how well the model preserves the contrast difference
+between source and target.
 
 > **Scale guarantee**: Both model outputs are converted to [0, 1] before metric computation. If a model outputs [-1, 1], it is auto-detected and converted.
 

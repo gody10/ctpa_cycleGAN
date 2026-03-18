@@ -28,14 +28,19 @@ spec:
               #   --test_csv ../data/Coltea-Lung-CT-100W/clean_test_data.csv
               # ──────────────────────────────────────────────────────────
 
-              args: ["-c", "# Train pix2pix
-                    python train_with_validation_checkpoints.py \
-                        --dataroot ../data/Coltea_Processed_Nifti_Registered \
-                        --name coltea_pix2pix_baseline --model pix2pix \
-                        --input_nc 1 --output_nc 1 \
-                        --n_epochs 100 --n_epochs_decay 100 \
-                        --batch_size 4 --use_validation --patience 30 --no_html"
-                                                            ]
+              args: ["-c", "python test.py \
+                    --dataroot ../data/Coltea_Processed_Nifti_Registered \
+                    --test_csv ../data/Coltea-Lung-CT-100W/test_data.csv \
+                    --name coltea_pix2pix_baseline --model pix2pix \
+                    --input_nc 1 --output_nc 1 \
+                    --epoch best \
+                    --eval \
+                    --subtraction_eval --save_subtractions \
+                    --roi_eval --fid_eval --frd_eval --frd_num_slices 5 \
+                    --save_generated_dir ./generated_cts/pix2pix_baseline"]
+
+              # Option G — Re-evaluate FRD from previously saved generated volumes (skip inference)
+              # args: ["-c", "python test.py --dataroot ../data/Coltea_Processed_Nifti_Registered --test_csv ../data/Coltea-Lung-CT-100W/test_data.csv --name coltea_pix2pix_baseline --model pix2pix --input_nc 1 --output_nc 1 --epoch best --eval --subtraction_eval --roi_eval --fid_eval --frd_eval --load_generated_dir ./generated_cts/pix2pix_baseline"]
 
               # ── CycleGAN Options ──
 

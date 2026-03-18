@@ -4,6 +4,7 @@ datasets/
 checkpoints/
 results/
 build/
+generated_cts/
 dist/
 *.png
 torch.egg-info/
