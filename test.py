@@ -401,20 +401,50 @@ def compute_fair_sub_metrics(
 # Konz et al., 2026
 # ============================================================================
 
-_FRD_GLCM_FEATURES = [
-    "Autocorrelation", "JointAverage", "ClusterProminence", "ClusterShade",
-    "ClusterTendency", "Contrast", "Correlation", "DifferenceAverage",
-    "DifferenceEntropy", "DifferenceVariance", "JointEnergy", "JointEntropy",
-    "Imc1", "Imc2", "Idm", "Idmn", "Id", "Idn", "InverseVariance",
-    "MaximumProbability", "SumEntropy", "SumSquares",
-]
-
-
 def extract_slices_for_radiomics(volume: np.ndarray, num_slices: int = 5) -> list:
     """(H, W, D) float32 in [0, 1] → list of num_slices (H, W) float32 arrays."""
     D = volume.shape[2]
     indices = np.linspace(D // 8, 7 * D // 8, num_slices).astype(int)
     return [volume[:, :, int(i)].astype(np.float32) for i in indices]
+
+
+def _extract_features_skimage(img_float: np.ndarray) -> np.ndarray:
+    """Extract texture features from a (H, W) float32 [0,1] image.
+
+    Returns a float32 vector: 11 first-order stats + 72 GLCM properties = 83 features.
+    Uses scikit-image, which is NumPy-version agnostic (avoids PyRadiomics/NumPy>=1.24 bug).
+    """
+    from skimage.feature import graycomatrix, graycoprops
+    from scipy.stats import skew as _skew, kurtosis as _kurt
+
+    img_uint8 = np.clip(img_float * 255, 0, 255).astype(np.uint8)
+    flat = img_uint8.flatten().astype(np.float64)
+
+    features = [
+        float(np.mean(flat)),
+        float(np.std(flat)),
+        float(_skew(flat)),
+        float(_kurt(flat)),
+        float(np.percentile(flat, 10)),
+        float(np.percentile(flat, 25)),
+        float(np.median(flat)),
+        float(np.percentile(flat, 75)),
+        float(np.percentile(flat, 90)),
+        float(np.ptp(flat)),
+        float(np.mean(flat ** 2)),
+    ]
+
+    img_q = (img_uint8 // 4).astype(np.uint8)
+    glcm = graycomatrix(
+        img_q,
+        distances=[1, 2, 3],
+        angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
+        levels=64, symmetric=True, normed=True,
+    )
+    for prop in ("contrast", "dissimilarity", "homogeneity", "energy", "correlation", "ASM"):
+        features.extend(graycoprops(glcm, prop).flatten().tolist())
+
+    return np.array(features, dtype=np.float32)
 
 
 def _build_radiomic_extractor(use_wavelet: bool = True):
@@ -459,55 +489,32 @@ def _build_radiomic_extractor(use_wavelet: bool = True):
 
 def check_frd_runtime_compatibility() -> tuple:
     """Validate FRD dependencies early to avoid failing only at the end of evaluation."""
-    np_major = int(np.__version__.split(".", 1)[0])
-    if np_major >= 2:
-        return (
-            False,
-            f"NumPy {np.__version__} detected. FRD with current PyRadiomics build requires NumPy < 2.",
-        )
     try:
-        import radiomics  # noqa: F401
-    except Exception as exc:
-        return False, f"PyRadiomics import failed: {exc}"
-    return True, f"FRD dependencies OK (NumPy {np.__version__})"
+        from skimage.feature import graycomatrix, graycoprops  # noqa: F401
+    except ImportError:
+        return False, "scikit-image not found; install with: pip install scikit-image"
+    try:
+        from scipy.stats import skew, kurtosis  # noqa: F401
+    except ImportError:
+        return False, "scipy not found; install with: pip install scipy"
+    return True, f"FRD dependencies OK (scikit-image GLCM, NumPy {np.__version__})"
 
 
-def extract_radiomic_features(images: list, extractor) -> np.ndarray:
+def extract_radiomic_features(images: list) -> np.ndarray:
     """Extract radiomic features from a list of (H, W) float32 [0,1] images.
 
-    Returns (N, ~464) float32 array; failed extractions → zeros.
+    Returns (N, 83) float32 array; failed extractions → zeros.
     """
-    import SimpleITK as sitk
-
     all_features = []
     n_failed = 0
-    fallback = None
     for image in tqdm(images, desc="Radiomics", leave=False):
         try:
-            img_uint8 = np.clip(image * 255, 0, 255).astype(np.uint8)
-            img_3d = img_uint8[np.newaxis, :, :].astype(np.float32)  # (1, H, W)
-            sitk_image = sitk.GetImageFromArray(img_3d)
-            sitk_image.SetSpacing((1.0, 1.0, 1.0))
-            mask_3d = np.ones((1, img_uint8.shape[0], img_uint8.shape[1]), dtype=np.uint8)
-            mask_3d[0][0][0] = 0  # corner=0 workaround for PyRadiomics bug #765
-            sitk_mask = sitk.GetImageFromArray(mask_3d)
-            sitk_mask.SetSpacing((1.0, 1.0, 1.0))
-            result = extractor.execute(sitk_image, sitk_mask)
-            feats = np.array(
-                [float(v) for k, v in sorted(result.items())
-                 if not k.startswith("diagnostics_")],
-                dtype=np.float32,
-            )
-            if fallback is None:
-                fallback = np.zeros_like(feats)
+            feats = _extract_features_skimage(image)
             all_features.append(feats)
         except Exception:
             n_failed += 1
-            all_features.append(None)
+            all_features.append(np.zeros(83, dtype=np.float32))
 
-    if fallback is None:
-        fallback = np.zeros(1, dtype=np.float32)
-    all_features = [f if f is not None else np.zeros_like(fallback) for f in all_features]
     if n_failed > 0:
         print(f"  [FRD] Skipped {n_failed}/{len(images)} images due to extraction errors.")
     features = np.stack(all_features, axis=0)
@@ -552,15 +559,10 @@ def _frechet_distance(mu1: np.ndarray, sigma1: np.ndarray,
 
 def compute_frd(real_images: list, fake_images: list) -> float:
     """Compute Fréchet Radiomic Distance between two sets of (H, W) float32 [0,1] images."""
-    try:
-        extractor = _build_radiomic_extractor(use_wavelet=True)
-    except ImportError as e:
-        print(f"  [FRD] Skipping: {e}")
-        return float("nan")
     print("  Extracting radiomic features for real images ...")
-    feats_real = extract_radiomic_features(real_images, extractor)
+    feats_real = extract_radiomic_features(real_images)
     print("  Extracting radiomic features for fake images ...")
-    feats_fake = extract_radiomic_features(fake_images, extractor)
+    feats_fake = extract_radiomic_features(fake_images)
     ref_pca, test_pca = _zscore_and_pca(feats_real, feats_fake)
     mu1 = np.mean(ref_pca, axis=0)
     sigma1 = np.cov(ref_pca, rowvar=False)
@@ -1619,7 +1621,7 @@ if __name__ == "__main__":
         if not np.isnan(frd_score):
             print(f"  FRD (radiomic): {frd_score:.6f}")
         else:
-            print("  FRD: FAILED (pyradiomics unavailable or extraction error)")
+            print("  FRD: FAILED (extraction error)")
 
     # Save metrics to CSV
     df = pd.DataFrame(results)
