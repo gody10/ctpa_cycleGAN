@@ -38,6 +38,17 @@ class TestOptions(BaseOptions):
         parser.add_argument('--load_generated_dir', type=str, default=None,
                             help='Directory to load pre-generated NIfTI volumes from, skipping model inference. '
                                  'Files must be named {patient_id}_pred.nii.gz in [0,1] space.')
+        parser.add_argument('--pe_roi_eval', action='store_true',
+                            help='Compute PE ROI metrics using TotalSegmentator pulmonary vessel masks '
+                                 '(lung_arteries + lung_veins + aorta + SVC) as the ROI. '
+                                 'Clinically appropriate for CTPA PE detection comparison.')
+        parser.add_argument('--pe_roi_data_root', type=str, default=None,
+                            help='Root directory containing per-patient TS vessel mask files for PE ROI. '
+                                 'Defaults to --dataroot.')
+        parser.add_argument('--la_eval', action='store_true',
+                            help='Compute lung-arteries-only metrics (la_roi_*) using the '
+                                 'TotalSegmentator lung_arteries label as the sole ROI '
+                                 '(ideal PE mask). Reuses --pe_roi_data_root.')
         # rewrite devalue values
         parser.set_defaults(model='test')
         # To avoid cropping, the load_size should be the same as crop_size

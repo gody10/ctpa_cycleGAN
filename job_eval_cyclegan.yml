@@ -26,8 +26,11 @@ spec:
                     --epoch best \
                     --eval \
                     --subtraction_eval --save_subtractions \
-                    --roi_eval --fid_eval --frd_eval --frd_num_slices 5 \
-                    --save_generated_dir ./generated_cts/cyclegan_clean"]
+                    --roi_eval --fid_eval --frd_eval --frd_num_slices 20 \
+                    --pe_roi_eval \
+                    --pe_roi_data_root /cephfs/eidf212/shared/odiamant/data/Coltea_Registered_Total_Segmentation \
+                    --la_eval \
+                    --load_generated_dir ./generated_cts/cyclegan_clean"]
 
               resources:
                     requests:

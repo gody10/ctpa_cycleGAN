@@ -24,6 +24,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
@@ -34,6 +35,33 @@ from dataset import ColteaPairedDataset3D, _normalize_to_neg1_pos1, _denormalize
 
 
 # Defaults are now defined in options/base_options.py (--test_csv, --csv_column)
+
+_VESSEL_STRUCTURES = ["aorta", "superior_vena_cava", "lung_arteries", "lung_veins"]
+_LUNG_ARTERIES_ONLY = ["lung_arteries"]
+
+
+def _load_vessel_mask_for_eval(patient_dir, structures, target_hw, num_slices, dilation=3):
+    """Load, union, dilate, and resize TS vessel masks for one patient.
+
+    Returns float32 array (H, W, D) in {0, 1}.
+    """
+    from scipy.ndimage import binary_dilation as _bd
+    H, W = target_hw
+    combined = None
+    for struct in structures:
+        path = Path(patient_dir) / f"{struct}.nii.gz"
+        if not path.exists():
+            continue
+        img = nib.as_closest_canonical(nib.load(str(path)))
+        data = np.asanyarray(img.dataobj, dtype=np.float32)
+        combined = data if combined is None else np.maximum(combined, data)
+    if combined is None:
+        return np.zeros((H, W, num_slices), dtype=np.float32)
+    if dilation > 0:
+        combined = _bd(combined > 0.5, iterations=dilation).astype(np.float32)
+    t = torch.from_numpy(combined).unsqueeze(0).unsqueeze(0)
+    t = torch.nn.functional.interpolate(t, size=(H, W, num_slices), mode="nearest")
+    return (t.squeeze().numpy() > 0.5).astype(np.float32)
 
 
 def psnr(target, pred, data_range=1.0):
@@ -108,6 +136,7 @@ def compute_cnr(subtraction: np.ndarray, vessel_mask: np.ndarray) -> float:
     Compute Contrast-to-Noise Ratio.
     CNR = (mean_vessel - mean_background) / std_background
     """
+    vessel_mask = vessel_mask.astype(bool)
     if vessel_mask.sum() == 0 or (~vessel_mask).sum() == 0:
         return 0.0
     mean_vessel = float(subtraction[vessel_mask].mean())
@@ -159,6 +188,7 @@ def compute_roi_metrics(
         vessel_mask: Boolean mask of vessel regions (from GT subtraction)
         data_range: Data range for PSNR (2.0 for [-1, 1])
     """
+    vessel_mask = vessel_mask.astype(bool)
     _HU_RANGE = 1000.0
     metrics = {
         "roi_dice": compute_vessel_dice(pred_sub, gt_sub),
@@ -166,14 +196,25 @@ def compute_roi_metrics(
         "roi_cnr_pred": compute_cnr(pred_sub, vessel_mask),
     }
     if vessel_mask.sum() > 0:
-        metrics["roi_mae"] = float(np.mean(np.abs(pred_sub[vessel_mask] - gt_sub[vessel_mask])))
+        diff = pred_sub[vessel_mask] - gt_sub[vessel_mask]
+        metrics["roi_mae"] = float(np.mean(np.abs(diff)))
         metrics["roi_mae_hu"] = metrics["roi_mae"] * _HU_RANGE
-        mse = float(np.mean((pred_sub[vessel_mask] - gt_sub[vessel_mask]) ** 2))
-        metrics["roi_psnr"] = float(10 * np.log10((data_range ** 2) / mse)) if mse > 0 else float('inf')
+        mse_val = float(np.mean(diff ** 2))
+        metrics["roi_rmse"] = float(np.sqrt(mse_val))
+        metrics["roi_psnr"] = float(10 * np.log10((data_range ** 2) / mse_val)) if mse_val > 0 else float('inf')
+        pred_masked = pred_sub * vessel_mask
+        gt_masked   = gt_sub   * vessel_mask
+        metrics["roi_ssim"] = ssim_3d(pred_masked, gt_masked, data_range=data_range)
+        metrics["roi_nmi"]  = compute_nmi(pred_sub[vessel_mask], gt_sub[vessel_mask])
+        metrics["roi_ncc"]  = compute_ncc(pred_sub[vessel_mask], gt_sub[vessel_mask])
     else:
         metrics["roi_mae"] = 0.0
         metrics["roi_mae_hu"] = 0.0
+        metrics["roi_rmse"] = 0.0
         metrics["roi_psnr"] = float('inf')
+        metrics["roi_ssim"] = 1.0
+        metrics["roi_nmi"]  = 1.0
+        metrics["roi_ncc"]  = 1.0
     return metrics
 
 
@@ -207,6 +248,152 @@ def compute_fid_2d(real_slices: list, fake_slices: list, device) -> float:
         t = torch.from_numpy(sl).permute(2, 0, 1).unsqueeze(0).to(device)
         fid_metric.update(t, real=False)
     return float(fid_metric.compute())
+
+
+# ============================================================================
+# Multi-Scale SSIM, NMI, NCC, fair-sub metrics — ported from evaluate_2d.py
+# ============================================================================
+
+def ms_ssim_3d(
+    target: np.ndarray,
+    pred: np.ndarray,
+    data_range: float = 1.0,
+    win_size: int = 7,
+    num_scales: int = 5,
+) -> float:
+    """Multi-Scale SSIM averaged over depth slices (last axis, HWD layout)."""
+    from scipy.ndimage import uniform_filter
+    _WEIGHTS = np.array([0.0448, 0.2856, 0.3001, 0.2363, 0.1333])[:num_scales]
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+
+    def _components_2d(p2d, t2d):
+        mu_p   = uniform_filter(p2d, size=win_size)
+        mu_t   = uniform_filter(t2d, size=win_size)
+        sig_p  = uniform_filter(p2d ** 2, size=win_size) - mu_p ** 2
+        sig_t  = uniform_filter(t2d ** 2, size=win_size) - mu_t ** 2
+        sig_pt = uniform_filter(p2d * t2d, size=win_size) - mu_p * mu_t
+        lum = float(np.mean((2 * mu_p * mu_t + C1) / (mu_p ** 2 + mu_t ** 2 + C1)))
+        cs  = float(np.mean((2 * sig_pt + C2) / (sig_p + sig_t + C2)))
+        return lum, cs
+
+    slice_scores = []
+    for d in range(target.shape[-1]):
+        t_sl = target[:, :, d].astype(np.float64)
+        p_sl = pred[:, :, d].astype(np.float64)
+        t_curr, p_curr = t_sl, p_sl
+        cs_vals, active = [], []
+        for s in range(num_scales):
+            if min(t_curr.shape) < win_size:
+                break
+            _, cs = _components_2d(p_curr, t_curr)
+            cs_vals.append(cs)
+            active.append(s)
+            if s < num_scales - 1:
+                h2 = t_curr.shape[0] // 2
+                w2 = t_curr.shape[1] // 2
+                if h2 == 0 or w2 == 0:
+                    break
+                t_curr = t_curr[:h2*2, :w2*2].reshape(h2, 2, w2, 2).mean(axis=(1, 3))
+                p_curr = p_curr[:h2*2, :w2*2].reshape(h2, 2, w2, 2).mean(axis=(1, 3))
+        if not cs_vals:
+            lum, cs = _components_2d(p_sl, t_sl)
+            slice_scores.append(lum * cs)
+            continue
+        lum_final, _ = _components_2d(p_curr, t_curr)
+        w = _WEIGHTS[active]
+        w = w / w.sum()
+        val = lum_final ** w[-1]
+        for i, cs_v in enumerate(cs_vals):
+            val *= abs(cs_v) ** w[i]
+        slice_scores.append(val)
+    return float(np.mean(slice_scores))
+
+
+def compute_nmi(a: np.ndarray, b: np.ndarray, bins: int = 64) -> float:
+    """Normalized Mutual Information: (H(A) + H(B)) / H(A,B). Values >= 1."""
+    a_flat = a.ravel().astype(np.float64)
+    b_flat = b.ravel().astype(np.float64)
+    hist_2d, _, _ = np.histogram2d(a_flat, b_flat, bins=bins)
+    pxy = hist_2d / hist_2d.sum()
+    px = pxy.sum(axis=1)
+    py = pxy.sum(axis=0)
+    h_x  = -np.sum(px[px > 0] * np.log(px[px > 0] + 1e-12))
+    h_y  = -np.sum(py[py > 0] * np.log(py[py > 0] + 1e-12))
+    nzs  = pxy > 0
+    h_xy = -np.sum(pxy[nzs] * np.log(pxy[nzs] + 1e-12))
+    if h_xy < 1e-12:
+        return 0.0
+    return float((h_x + h_y) / h_xy)
+
+
+def compute_ncc(a: np.ndarray, b: np.ndarray) -> float:
+    """Normalized Cross-Correlation (Pearson). Range [-1, 1]; 1 = perfect."""
+    a_f = a.ravel().astype(np.float64)
+    b_f = b.ravel().astype(np.float64)
+    a_std = a_f.std()
+    b_std = b_f.std()
+    if a_std < 1e-8 or b_std < 1e-8:
+        return 0.0
+    return float(np.mean((a_f - a_f.mean()) * (b_f - b_f.mean())) / (a_std * b_std))
+
+
+def compute_fair_sub_metrics(
+    pred_sub: np.ndarray,
+    gt_sub: np.ndarray,
+    vessel_mask: np.ndarray,
+    data_range: float = 2.0,
+) -> dict:
+    """Subtraction-domain metrics restricted to vessel mask (eliminates background-copy inflation).
+
+    Args:
+        pred_sub / gt_sub: (D, H, W) in [-1, 1]
+        vessel_mask: (D, H, W) binary float {0, 1}
+        data_range: 2.0 to match roi_psnr convention
+    """
+    from scipy.ndimage import uniform_filter
+    _HU_SCALE = 1000.0
+    m = vessel_mask.astype(bool)
+    if m.sum() == 0:
+        return {
+            "fair_sub_psnr":     float("nan"),
+            "fair_sub_ssim":     float("nan"),
+            "fair_sub_mae_hu":   float("nan"),
+            "fair_sub_mae_norm": float("nan"),
+        }
+    mse = float(np.mean((pred_sub[m] - gt_sub[m]) ** 2))
+    fair_sub_psnr = (
+        float(10.0 * np.log10(data_range ** 2 / mse)) if mse > 1e-12 else float("inf")
+    )
+    fair_sub_mae_norm = float(np.mean(np.abs(pred_sub[m] - gt_sub[m])))
+    fair_sub_mae_hu   = fair_sub_mae_norm * _HU_SCALE
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+    ssim_scores = []
+    win_size = 7
+    for d in range(pred_sub.shape[0]):
+        m_sl = vessel_mask[d]
+        if m_sl.sum() < 10:
+            continue
+        p = pred_sub[d].astype(np.float64)
+        t = gt_sub[d].astype(np.float64)
+        mu_p   = uniform_filter(p, size=win_size)
+        mu_t   = uniform_filter(t, size=win_size)
+        sig_p  = uniform_filter(p ** 2, size=win_size) - mu_p ** 2
+        sig_t  = uniform_filter(t ** 2, size=win_size) - mu_t ** 2
+        sig_pt = uniform_filter(p * t,  size=win_size) - mu_p * mu_t
+        ssim_map = (
+            ((2 * mu_p * mu_t + C1) * (2 * sig_pt + C2))
+            / ((mu_p ** 2 + mu_t ** 2 + C1) * (sig_p + sig_t + C2))
+        )
+        ssim_scores.append(float(ssim_map[m_sl.astype(bool)].mean()))
+    fair_sub_ssim = float(np.mean(ssim_scores)) if ssim_scores else float("nan")
+    return {
+        "fair_sub_psnr":     fair_sub_psnr,
+        "fair_sub_ssim":     fair_sub_ssim,
+        "fair_sub_mae_hu":   fair_sub_mae_hu,
+        "fair_sub_mae_norm": fair_sub_mae_norm,
+    }
 
 
 # ============================================================================
@@ -1040,16 +1227,24 @@ def test_full_volume(model, source_vol, target_vol, opt, patient_id, output_dir)
     input_volume = source_vol.squeeze(0).cpu().numpy()
 
     # Compute volume-level metrics
-    vol_psnr = psnr(gt_volume, generated_volume, data_range=1.0)
-    vol_ssim = ssim_3d(gt_volume, generated_volume, data_range=1.0)
-    vol_mae = mae(gt_volume, generated_volume)
-    vol_rmse = rmse(gt_volume, generated_volume)
+    vol_psnr    = psnr(gt_volume, generated_volume, data_range=1.0)
+    vol_ssim    = ssim_3d(gt_volume, generated_volume, data_range=1.0)
+    vol_ms_ssim = ms_ssim_3d(gt_volume, generated_volume, data_range=1.0)
+    vol_mae     = mae(gt_volume, generated_volume)
+    vol_rmse    = rmse(gt_volume, generated_volume)
+    vol_mse     = float(np.mean((gt_volume - generated_volume) ** 2))
+    vol_nmi     = compute_nmi(gt_volume, generated_volume)
+    vol_ncc     = compute_ncc(gt_volume, generated_volume)
 
     metrics_dict = {
-        "psnr": vol_psnr,
-        "ssim": vol_ssim,
-        "mae": vol_mae,
-        "rmse": vol_rmse,
+        "psnr":    vol_psnr,
+        "ssim":    vol_ssim,
+        "ms_ssim": vol_ms_ssim,
+        "mae":     vol_mae,
+        "rmse":    vol_rmse,
+        "mse":     vol_mse,
+        "nmi":     vol_nmi,
+        "ncc":     vol_ncc,
     }
 
     # --- Publication-quality visualizations (matching diffusion model) ---
@@ -1092,6 +1287,9 @@ if __name__ == "__main__":
     frd_num_slices = opt.frd_num_slices
     save_generated_dir = opt.save_generated_dir
     load_generated_dir = opt.load_generated_dir
+    pe_roi_eval = opt.pe_roi_eval
+    pe_roi_data_root = Path(opt.pe_roi_data_root or opt.dataroot)
+    la_eval = opt.la_eval
 
     # Hard-code some parameters for test
     opt.num_threads = 0
@@ -1120,6 +1318,10 @@ if __name__ == "__main__":
         print("Save subtraction NIfTIs: ENABLED")
     if roi_eval:
         print(f"ROI vessel evaluation: ENABLED (threshold={vessel_threshold_hu} HU)")
+    if pe_roi_eval:
+        print(f"PE ROI evaluation: ENABLED (TS masks from {pe_roi_data_root})")
+    if la_eval:
+        print(f"LA-only evaluation: ENABLED (lung_arteries mask from {pe_roi_data_root})")
     if fid_eval:
         print("FID evaluation: ENABLED")
     if frd_eval:
@@ -1178,11 +1380,19 @@ if __name__ == "__main__":
                     generated_vol = nib.load(pred_path).get_fdata().astype(np.float32)
                     gt_vol = target_vol.squeeze(0).cpu().numpy()
                     input_vol = source_vol.squeeze(0).cpu().numpy()
-                    vol_psnr = psnr(gt_vol, generated_vol, data_range=1.0)
-                    vol_ssim = ssim_3d(gt_vol, generated_vol, data_range=1.0)
-                    vol_mae = mae(gt_vol, generated_vol)
-                    vol_rmse = rmse(gt_vol, generated_vol)
-                    metrics_dict = {"psnr": vol_psnr, "ssim": vol_ssim, "mae": vol_mae, "rmse": vol_rmse}
+                    vol_psnr    = psnr(gt_vol, generated_vol, data_range=1.0)
+                    vol_ssim    = ssim_3d(gt_vol, generated_vol, data_range=1.0)
+                    vol_ms_ssim = ms_ssim_3d(gt_vol, generated_vol, data_range=1.0)
+                    vol_mae     = mae(gt_vol, generated_vol)
+                    vol_rmse    = rmse(gt_vol, generated_vol)
+                    vol_mse     = float(np.mean((gt_vol - generated_vol) ** 2))
+                    vol_nmi     = compute_nmi(gt_vol, generated_vol)
+                    vol_ncc     = compute_ncc(gt_vol, generated_vol)
+                    metrics_dict = {
+                        "psnr": vol_psnr, "ssim": vol_ssim, "ms_ssim": vol_ms_ssim,
+                        "mae": vol_mae, "rmse": vol_rmse, "mse": vol_mse,
+                        "nmi": vol_nmi, "ncc": vol_ncc,
+                    }
                     src_dhw = np.transpose(input_vol * 2.0 - 1.0, (2, 0, 1))
                     gen_dhw = np.transpose(generated_vol * 2.0 - 1.0, (2, 0, 1))
                     gt_dhw  = np.transpose(gt_vol * 2.0 - 1.0, (2, 0, 1))
@@ -1248,6 +1458,49 @@ if __name__ == "__main__":
                     vessel_mask = create_vessel_mask(gt_sub_roi, threshold_hu=vessel_threshold_hu)
                     roi_metrics = compute_roi_metrics(pred_sub_roi, gt_sub_roi, vessel_mask)
 
+                # ---- PE ROI metrics (TS vessel mask as ROI) ----
+                pe_roi_metrics = {}
+                fair_sub_metrics = {}
+                if pe_roi_eval:
+                    _H, _W, _D = generated_vol.shape
+                    pe_mask_hwd = _load_vessel_mask_for_eval(
+                        patient_dir=pe_roi_data_root / patient_id,
+                        structures=_VESSEL_STRUCTURES,
+                        target_hw=(_H, _W),
+                        num_slices=_D,
+                    )
+                    pe_mask_dhw = np.transpose(pe_mask_hwd, (2, 0, 1))
+                    pred_sub_pe = src_dhw - gen_dhw
+                    gt_sub_pe   = src_dhw - gt_dhw
+                    raw = compute_roi_metrics(pred_sub_pe, gt_sub_pe, pe_mask_dhw)
+                    pe_roi_metrics = {f"pe_{k}": v for k, v in raw.items()}
+                    raw_fair = compute_fair_sub_metrics(pred_sub_pe, gt_sub_pe, pe_mask_dhw)
+                    fair_sub_metrics = raw_fair
+
+                # ---- LA-only metrics (lung_arteries ideal PE mask) ----
+                la_roi_metrics = {}
+                la_sub_metrics = {}
+                if la_eval:
+                    _H, _W, _D = generated_vol.shape
+                    la_mask_hwd = _load_vessel_mask_for_eval(
+                        patient_dir=pe_roi_data_root / patient_id,
+                        structures=_LUNG_ARTERIES_ONLY,
+                        target_hw=(_H, _W),
+                        num_slices=_D,
+                    )
+                    la_mask_dhw = np.transpose(la_mask_hwd, (2, 0, 1))
+                    if pe_roi_eval:
+                        _la_pred_sub = pred_sub_pe
+                        _la_gt_sub = gt_sub_pe
+                    else:
+                        _la_pred_sub = src_dhw - gen_dhw
+                        _la_gt_sub = src_dhw - gt_dhw
+                    raw_la = compute_roi_metrics(_la_pred_sub, _la_gt_sub, la_mask_dhw)
+                    la_roi_metrics = {f"la_{k}": v for k, v in raw_la.items()}
+                    raw_la_sub = compute_fair_sub_metrics(_la_pred_sub, _la_gt_sub, la_mask_dhw)
+                    la_sub_metrics = {k.replace("fair_sub_", "la_sub_"): v
+                                      for k, v in raw_la_sub.items()}
+
                 # ---- FID: collect centre axial slices in [-1, 1] (D, H, W) ----
                 if fid_eval:
                     fid_real_slices.append(extract_centre_axial_slice_uint8(gt_dhw))
@@ -1263,6 +1516,10 @@ if __name__ == "__main__":
                     **metrics_dict,
                     **sub_metrics,
                     **roi_metrics,
+                    **pe_roi_metrics,
+                    **fair_sub_metrics,
+                    **la_roi_metrics,
+                    **la_sub_metrics,
                 })
 
                 msg = (f"  {patient_id}: PSNR={metrics_dict['psnr']:.2f} dB | "
@@ -1275,6 +1532,20 @@ if __name__ == "__main__":
                     msg += (f"  | Dice={roi_metrics['roi_dice']:.4f}"
                             f" CNR(GT)={roi_metrics['roi_cnr_gt']:.2f}"
                             f" CNR(Pred)={roi_metrics['roi_cnr_pred']:.2f}")
+                if pe_roi_metrics:
+                    msg += (f"  | PE-CNR(GT)={pe_roi_metrics['pe_roi_cnr_gt']:.2f}"
+                            f" PE-CNR(Pred)={pe_roi_metrics['pe_roi_cnr_pred']:.2f}"
+                            f" PE-MAE={pe_roi_metrics['pe_roi_mae_hu']:.1f}HU")
+                if fair_sub_metrics:
+                    msg += (f"  | FairSub-MAE={fair_sub_metrics['fair_sub_mae_hu']:.1f}HU"
+                            f" FairSub-SSIM={fair_sub_metrics['fair_sub_ssim']:.4f}")
+                if la_roi_metrics:
+                    msg += (f"  | LA-CNR(GT)={la_roi_metrics['la_roi_cnr_gt']:.2f}"
+                            f" LA-CNR(Pred)={la_roi_metrics['la_roi_cnr_pred']:.2f}"
+                            f" LA-MAE={la_roi_metrics['la_roi_mae_hu']:.1f}HU")
+                if la_sub_metrics:
+                    msg += (f"  | LA-Sub-MAE={la_sub_metrics['la_sub_mae_hu']:.1f}HU"
+                            f" LA-Sub-SSIM={la_sub_metrics['la_sub_ssim']:.4f}")
                 print(msg)
 
                 # Save NIfTI volumes
@@ -1293,26 +1564,42 @@ if __name__ == "__main__":
                 print(f"\nError processing {patient_id}: {e}")
                 error_entry = {
                     "patient_id": patient_id,
-                    "psnr": float('nan'),
-                    "ssim": float('nan'),
-                    "mae": float('nan'),
-                    "rmse": float('nan'),
+                    "psnr": float('nan'), "ssim": float('nan'), "ms_ssim": float('nan'),
+                    "mae": float('nan'), "rmse": float('nan'), "mse": float('nan'),
+                    "nmi": float('nan'), "ncc": float('nan'),
                 }
                 if subtraction_eval:
                     error_entry.update({
-                        "sub_psnr": float('nan'),
-                        "sub_ssim": float('nan'),
-                        "sub_mae": float('nan'),
-                        "sub_rmse": float('nan'),
+                        "sub_psnr": float('nan'), "sub_ssim": float('nan'),
+                        "sub_mae": float('nan'), "sub_rmse": float('nan'),
                     })
                 if roi_eval:
                     error_entry.update({
-                        "roi_dice": float('nan'),
-                        "roi_cnr_gt": float('nan'),
-                        "roi_cnr_pred": float('nan'),
-                        "roi_mae": float('nan'),
-                        "roi_mae_hu": float('nan'),
-                        "roi_psnr": float('nan'),
+                        "roi_dice": float('nan'), "roi_cnr_gt": float('nan'),
+                        "roi_cnr_pred": float('nan'), "roi_mae": float('nan'),
+                        "roi_mae_hu": float('nan'), "roi_rmse": float('nan'),
+                        "roi_psnr": float('nan'), "roi_ssim": float('nan'),
+                        "roi_nmi": float('nan'), "roi_ncc": float('nan'),
+                    })
+                if pe_roi_eval:
+                    error_entry.update({
+                        "pe_roi_dice": float('nan'), "pe_roi_cnr_gt": float('nan'),
+                        "pe_roi_cnr_pred": float('nan'), "pe_roi_mae": float('nan'),
+                        "pe_roi_mae_hu": float('nan'), "pe_roi_rmse": float('nan'),
+                        "pe_roi_psnr": float('nan'), "pe_roi_ssim": float('nan'),
+                        "pe_roi_nmi": float('nan'), "pe_roi_ncc": float('nan'),
+                        "fair_sub_psnr": float('nan'), "fair_sub_ssim": float('nan'),
+                        "fair_sub_mae_hu": float('nan'), "fair_sub_mae_norm": float('nan'),
+                    })
+                if la_eval:
+                    error_entry.update({
+                        "la_roi_dice": float('nan'), "la_roi_cnr_gt": float('nan'),
+                        "la_roi_cnr_pred": float('nan'), "la_roi_mae": float('nan'),
+                        "la_roi_mae_hu": float('nan'), "la_roi_rmse": float('nan'),
+                        "la_roi_psnr": float('nan'), "la_roi_ssim": float('nan'),
+                        "la_roi_nmi": float('nan'), "la_roi_ncc": float('nan'),
+                        "la_sub_psnr": float('nan'), "la_sub_ssim": float('nan'),
+                        "la_sub_mae_hu": float('nan'), "la_sub_mae_norm": float('nan'),
                     })
                 results.append(error_entry)
                 continue
@@ -1339,11 +1626,25 @@ if __name__ == "__main__":
     df.to_csv(os.path.join(output_dir, "metrics.csv"), index=False)
 
     # Build and save JSON results (matching diffusion model format)
-    metric_names = ["psnr", "ssim", "mae", "rmse"]
+    metric_names = ["psnr", "ssim", "ms_ssim", "mae", "rmse", "mse", "nmi", "ncc"]
     if subtraction_eval:
         metric_names += ["sub_psnr", "sub_ssim", "sub_mae", "sub_rmse"]
     if roi_eval:
-        metric_names += ["roi_dice", "roi_cnr_gt", "roi_cnr_pred", "roi_mae", "roi_mae_hu", "roi_psnr"]
+        metric_names += ["roi_dice", "roi_cnr_gt", "roi_cnr_pred",
+                         "roi_mae", "roi_mae_hu", "roi_rmse", "roi_psnr",
+                         "roi_ssim", "roi_nmi", "roi_ncc"]
+    if pe_roi_eval:
+        metric_names += ["pe_roi_dice", "pe_roi_cnr_gt", "pe_roi_cnr_pred",
+                         "pe_roi_mae", "pe_roi_mae_hu", "pe_roi_rmse",
+                         "pe_roi_psnr", "pe_roi_ssim", "pe_roi_nmi", "pe_roi_ncc",
+                         "fair_sub_psnr", "fair_sub_ssim",
+                         "fair_sub_mae_hu", "fair_sub_mae_norm"]
+    if la_eval:
+        metric_names += ["la_roi_dice", "la_roi_cnr_gt", "la_roi_cnr_pred",
+                         "la_roi_mae", "la_roi_mae_hu", "la_roi_rmse",
+                         "la_roi_psnr", "la_roi_ssim", "la_roi_nmi", "la_roi_ncc",
+                         "la_sub_psnr", "la_sub_ssim",
+                         "la_sub_mae_hu", "la_sub_mae_norm"]
     aggregate_metrics = {}
     for m in metric_names:
         vals = df[m].dropna()
@@ -1384,10 +1685,13 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print(f"TEST RESULTS ({len(test_ds)} Patients)")
     print("=" * 60)
-    print(f"Average PSNR: {aggregate_metrics['psnr_mean']:.4f} +/- {aggregate_metrics['psnr_std']:.4f}")
-    print(f"Average SSIM: {aggregate_metrics['ssim_mean']:.4f} +/- {aggregate_metrics['ssim_std']:.4f}")
-    print(f"Average MAE:  {aggregate_metrics['mae_mean']:.4f} +/- {aggregate_metrics['mae_std']:.4f}")
-    print(f"Average RMSE: {aggregate_metrics['rmse_mean']:.4f} +/- {aggregate_metrics['rmse_std']:.4f}")
+    print(f"Average PSNR:    {aggregate_metrics['psnr_mean']:.4f} +/- {aggregate_metrics['psnr_std']:.4f}")
+    print(f"Average SSIM:    {aggregate_metrics['ssim_mean']:.4f} +/- {aggregate_metrics['ssim_std']:.4f}")
+    print(f"Average MS-SSIM: {aggregate_metrics['ms_ssim_mean']:.4f} +/- {aggregate_metrics['ms_ssim_std']:.4f}")
+    print(f"Average MAE:     {aggregate_metrics['mae_mean']:.4f} +/- {aggregate_metrics['mae_std']:.4f}")
+    print(f"Average RMSE:    {aggregate_metrics['rmse_mean']:.4f} +/- {aggregate_metrics['rmse_std']:.4f}")
+    print(f"Average NMI:     {aggregate_metrics['nmi_mean']:.4f} +/- {aggregate_metrics['nmi_std']:.4f}")
+    print(f"Average NCC:     {aggregate_metrics['ncc_mean']:.4f} +/- {aggregate_metrics['ncc_std']:.4f}")
     if subtraction_eval:
         print("-" * 60)
         print("SUBTRACTION METRICS  (source - generated) vs (source - ground_truth)")
@@ -1405,7 +1709,53 @@ if __name__ == "__main__":
         print(f"CNR (Pred):   {aggregate_metrics['roi_cnr_pred_mean']:.2f} +/- {aggregate_metrics['roi_cnr_pred_std']:.2f}")
         print(f"ROI MAE:      {aggregate_metrics['roi_mae_mean']:.4f} +/- {aggregate_metrics['roi_mae_std']:.4f}")
         print(f"ROI MAE (HU): {aggregate_metrics['roi_mae_hu_mean']:.2f} +/- {aggregate_metrics['roi_mae_hu_std']:.2f} HU")
+        print(f"ROI RMSE:     {aggregate_metrics['roi_rmse_mean']:.4f} +/- {aggregate_metrics['roi_rmse_std']:.4f}")
         print(f"ROI PSNR:     {aggregate_metrics['roi_psnr_mean']:.2f} +/- {aggregate_metrics['roi_psnr_std']:.2f} dB")
+        print(f"ROI SSIM:     {aggregate_metrics['roi_ssim_mean']:.4f} +/- {aggregate_metrics['roi_ssim_std']:.4f}")
+        print(f"ROI NMI:      {aggregate_metrics['roi_nmi_mean']:.4f} +/- {aggregate_metrics['roi_nmi_std']:.4f}")
+        print(f"ROI NCC:      {aggregate_metrics['roi_ncc_mean']:.4f} +/- {aggregate_metrics['roi_ncc_std']:.4f}")
+    if pe_roi_eval:
+        print("-" * 60)
+        print("PE ROI METRICS  (TS: lung_arteries + lung_veins + aorta + SVC)")
+        print("-" * 60)
+        print(f"Dice:         {aggregate_metrics['pe_roi_dice_mean']:.4f} +/- {aggregate_metrics['pe_roi_dice_std']:.4f}")
+        print(f"CNR (GT):     {aggregate_metrics['pe_roi_cnr_gt_mean']:.2f} +/- {aggregate_metrics['pe_roi_cnr_gt_std']:.2f}")
+        print(f"CNR (Pred):   {aggregate_metrics['pe_roi_cnr_pred_mean']:.2f} +/- {aggregate_metrics['pe_roi_cnr_pred_std']:.2f}")
+        print(f"PE ROI MAE:      {aggregate_metrics['pe_roi_mae_mean']:.4f} +/- {aggregate_metrics['pe_roi_mae_std']:.4f}")
+        print(f"PE ROI MAE (HU): {aggregate_metrics['pe_roi_mae_hu_mean']:.2f} +/- {aggregate_metrics['pe_roi_mae_hu_std']:.2f} HU")
+        print(f"PE ROI RMSE:     {aggregate_metrics['pe_roi_rmse_mean']:.4f} +/- {aggregate_metrics['pe_roi_rmse_std']:.4f}")
+        print(f"PE ROI PSNR:     {aggregate_metrics['pe_roi_psnr_mean']:.2f} +/- {aggregate_metrics['pe_roi_psnr_std']:.2f} dB")
+        print(f"PE ROI SSIM:     {aggregate_metrics['pe_roi_ssim_mean']:.4f} +/- {aggregate_metrics['pe_roi_ssim_std']:.4f}")
+        print(f"PE ROI NMI:      {aggregate_metrics['pe_roi_nmi_mean']:.4f} +/- {aggregate_metrics['pe_roi_nmi_std']:.4f}")
+        print(f"PE ROI NCC:      {aggregate_metrics['pe_roi_ncc_mean']:.4f} +/- {aggregate_metrics['pe_roi_ncc_std']:.4f}")
+        print("-" * 60)
+        print("FAIR SUB METRICS  (subtraction restricted to TS vessel mask)")
+        print("-" * 60)
+        print(f"Fair Sub MAE (HU): {aggregate_metrics['fair_sub_mae_hu_mean']:.2f} +/- {aggregate_metrics['fair_sub_mae_hu_std']:.2f} HU")
+        print(f"Fair Sub SSIM:     {aggregate_metrics['fair_sub_ssim_mean']:.4f} +/- {aggregate_metrics['fair_sub_ssim_std']:.4f}")
+        print(f"Fair Sub PSNR:     {aggregate_metrics['fair_sub_psnr_mean']:.2f} +/- {aggregate_metrics['fair_sub_psnr_std']:.2f} dB")
+        print(f"Fair Sub MAE norm: {aggregate_metrics['fair_sub_mae_norm_mean']:.4f} +/- {aggregate_metrics['fair_sub_mae_norm_std']:.4f}")
+    if la_eval:
+        print("-" * 60)
+        print("LA-ONLY METRICS  (TS: lung_arteries — ideal PE mask)")
+        print("-" * 60)
+        print(f"Dice:         {aggregate_metrics['la_roi_dice_mean']:.4f} +/- {aggregate_metrics['la_roi_dice_std']:.4f}")
+        print(f"CNR (GT):     {aggregate_metrics['la_roi_cnr_gt_mean']:.2f} +/- {aggregate_metrics['la_roi_cnr_gt_std']:.2f}")
+        print(f"CNR (Pred):   {aggregate_metrics['la_roi_cnr_pred_mean']:.2f} +/- {aggregate_metrics['la_roi_cnr_pred_std']:.2f}")
+        print(f"LA ROI MAE:      {aggregate_metrics['la_roi_mae_mean']:.4f} +/- {aggregate_metrics['la_roi_mae_std']:.4f}")
+        print(f"LA ROI MAE (HU): {aggregate_metrics['la_roi_mae_hu_mean']:.2f} +/- {aggregate_metrics['la_roi_mae_hu_std']:.2f} HU")
+        print(f"LA ROI RMSE:     {aggregate_metrics['la_roi_rmse_mean']:.4f} +/- {aggregate_metrics['la_roi_rmse_std']:.4f}")
+        print(f"LA ROI PSNR:     {aggregate_metrics['la_roi_psnr_mean']:.2f} +/- {aggregate_metrics['la_roi_psnr_std']:.2f} dB")
+        print(f"LA ROI SSIM:     {aggregate_metrics['la_roi_ssim_mean']:.4f} +/- {aggregate_metrics['la_roi_ssim_std']:.4f}")
+        print(f"LA ROI NMI:      {aggregate_metrics['la_roi_nmi_mean']:.4f} +/- {aggregate_metrics['la_roi_nmi_std']:.4f}")
+        print(f"LA ROI NCC:      {aggregate_metrics['la_roi_ncc_mean']:.4f} +/- {aggregate_metrics['la_roi_ncc_std']:.4f}")
+        print("-" * 60)
+        print("LA SUB METRICS  (subtraction restricted to lung_arteries mask)")
+        print("-" * 60)
+        print(f"LA Sub MAE (HU): {aggregate_metrics['la_sub_mae_hu_mean']:.2f} +/- {aggregate_metrics['la_sub_mae_hu_std']:.2f} HU")
+        print(f"LA Sub SSIM:     {aggregate_metrics['la_sub_ssim_mean']:.4f} +/- {aggregate_metrics['la_sub_ssim_std']:.4f}")
+        print(f"LA Sub PSNR:     {aggregate_metrics['la_sub_psnr_mean']:.2f} +/- {aggregate_metrics['la_sub_psnr_std']:.2f} dB")
+        print(f"LA Sub MAE norm: {aggregate_metrics['la_sub_mae_norm_mean']:.4f} +/- {aggregate_metrics['la_sub_mae_norm_std']:.4f}")
     if fid_score is not None:
         print("-" * 60)
         print(f"FID (2D axial): {fid_score:.4f}")
